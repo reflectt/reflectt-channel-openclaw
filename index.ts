@@ -57,6 +57,18 @@ function dedup(id: string): boolean {
   return true;
 }
 
+// --- Runtime dispatch telemetry ---
+const dispatchCountByMessageId = new Map<string, number>();
+function incrementDispatchCount(messageId: string): number {
+  const next = (dispatchCountByMessageId.get(messageId) ?? 0) + 1;
+  dispatchCountByMessageId.set(messageId, next);
+  if (dispatchCountByMessageId.size > 1000) {
+    const oldest = dispatchCountByMessageId.keys().next().value;
+    if (oldest) dispatchCountByMessageId.delete(oldest);
+  }
+  return next;
+}
+
 // --- SSE connection ---
 
 let sseRequest: http.ClientRequest | null = null;
@@ -136,7 +148,11 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
     const from: string = msg.from || "unknown";
     const channel: string = msg.channel || "general";
 
-    if (!msgId || !dedup(msgId)) return;
+    if (!msgId) return;
+    if (!dedup(msgId)) {
+      ctx.log?.debug(`[reflectt][dispatch-telemetry] duplicate inbound ignored message_id=${msgId}`);
+      return;
+    }
 
     // Extract @mentions
     const mentions: string[] = [];
@@ -165,6 +181,11 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
 
     // Find mentioned agent
     ctx.log?.debug(`[reflectt] Processing mentions: ${mentions.join(", ")}`);
+    let matchedMentions = 0;
+    let skippedSelfMentions = 0;
+    let unmatchedMentions = 0;
+    const dispatchedTargets: string[] = [];
+
     for (const mention of mentions) {
       let agentId: string | undefined;
       for (const a of agentList) {
@@ -173,16 +194,19 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       }
       if (!agentId && mention === "kai") agentId = "main";
       if (!agentId) {
+        unmatchedMentions += 1;
         ctx.log?.debug(`[reflectt] Mention @${mention} did not match any agent`);
         continue;
       }
 
       // Skip routing to yourself (avoid self-loops)
       if (senderAgentId && agentId === senderAgentId) {
+        skippedSelfMentions += 1;
         ctx.log?.debug(`[reflectt] Skipping self-mention: @${agentId}`);
         continue;
       }
 
+      matchedMentions += 1;
       ctx.log?.info(`[reflectt] ${from} → @${agentId}: ${content.slice(0, 60)}...`);
 
       // Build inbound message context
@@ -234,6 +258,12 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       });
 
       // Dispatch reply using OpenClaw's pipeline
+      const dispatchCount = incrementDispatchCount(msgId);
+      dispatchedTargets.push(agentId);
+      ctx.log?.info(
+        `[reflectt][dispatch-telemetry] message_id=${msgId} dispatch_count=${dispatchCount} target=${agentId} mentions_total=${mentions.length}`,
+      );
+
       runtime.channel.reply.dispatchReplyFromConfig({
         ctx: finalizedCtx,
         cfg,
@@ -243,6 +273,10 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
         ctx.log?.error(`[reflectt] dispatchReplyFromConfig error: ${err}`);
       });
     }
+
+    ctx.log?.info(
+      `[reflectt][dispatch-telemetry] summary message_id=${msgId} mentions_total=${mentions.length} matched=${matchedMentions} unmatched=${unmatchedMentions} skipped_self=${skippedSelfMentions} dispatched=${dispatchedTargets.length} targets=${dispatchedTargets.join(",") || "none"}`,
+    );
   } catch (err) {
     ctx.log?.error(`[reflectt] Parse error: ${err}`);
   }
