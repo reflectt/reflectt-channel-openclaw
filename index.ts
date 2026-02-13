@@ -11,6 +11,15 @@ import http from "node:http";
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
+const WATCHED_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
+const WATCHED_SET = new Set<string>(WATCHED_AGENTS);
+const IDLE_NUDGE_WINDOW_MS = 15 * 60 * 1000; // 15m
+const WATCHDOG_INTERVAL_MS = 60 * 1000; // 1m
+const ESCALATION_COOLDOWN_MS = 20 * 60 * 1000;
+
+const lastUpdateByAgent = new Map<string, number>();
+const lastEscalationAt = new Map<string, number>();
+
 // --- Config helpers ---
 
 interface ReflecttAccount {
@@ -48,6 +57,67 @@ function postMessage(url: string, from: string, channel: string, content: string
   });
 }
 
+function normalizeSenderId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const id = value.trim().toLowerCase().replace(/^@+/, "");
+  return id.length > 0 ? id : null;
+}
+
+function markAgentActivity(from: unknown, channel: unknown, timestamp: unknown) {
+  if (channel !== "general") return;
+  const id = normalizeSenderId(from);
+  if (!id || !WATCHED_SET.has(id)) return;
+  const ts =
+    typeof timestamp === "number" && Number.isFinite(timestamp)
+      ? timestamp
+      : typeof timestamp === "string" && Number.isFinite(Number(timestamp))
+        ? Number(timestamp)
+        : Date.now();
+  const cur = lastUpdateByAgent.get(id) ?? 0;
+  if (ts > cur) lastUpdateByAgent.set(id, ts);
+}
+
+function shouldEscalate(key: string, now: number): boolean {
+  const last = lastEscalationAt.get(key) ?? 0;
+  if (now - last < ESCALATION_COOLDOWN_MS) return false;
+  lastEscalationAt.set(key, now);
+  return true;
+}
+
+async function fetchRecentMessages(url: string): Promise<Array<Record<string, unknown>>> {
+  const endpoints = ["/chat/messages?limit=500", "/chat/messages", "/messages"];
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(`${url}${endpoint}`);
+      if (!response.ok) continue;
+      const data = await response.json();
+      const messages = Array.isArray(data)
+        ? data
+        : data && typeof data === "object" && Array.isArray((data as { messages?: unknown[] }).messages)
+          ? (data as { messages: unknown[] }).messages
+          : [];
+      return messages.filter((m): m is Record<string, unknown> => Boolean(m) && typeof m === "object");
+    } catch {
+      // best effort
+    }
+  }
+  return [];
+}
+
+async function seedAgentActivity(url: string, log?: any) {
+  const now = Date.now();
+  for (const agent of WATCHED_AGENTS) {
+    lastUpdateByAgent.set(agent, now);
+  }
+
+  const messages = await fetchRecentMessages(url);
+  for (const msg of messages) {
+    markAgentActivity(msg.from, msg.channel, msg.timestamp);
+  }
+
+  log?.info?.(`[reflectt][watchdog] seeded activity from ${messages.length} recent message(s)`);
+}
+
 // --- Dedup ---
 const seen = new Set<string>();
 function dedup(id: string): boolean {
@@ -73,6 +143,7 @@ function incrementDispatchCount(messageId: string): number {
 
 let sseRequest: http.ClientRequest | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 let stopped = false;
 let pluginRuntime: any = null;
 
@@ -140,6 +211,36 @@ function scheduleReconnect(url: string, account: ReflecttAccount, ctx: any) {
   reconnectTimer = setTimeout(() => { reconnectTimer = null; connectSSE(url, account, ctx); }, 5000);
 }
 
+function startWatchdog(url: string, ctx: any) {
+  if (watchdogTimer) return;
+
+  watchdogTimer = setInterval(async () => {
+    const now = Date.now();
+    for (const agent of WATCHED_AGENTS) {
+      const lastUpdateAt = lastUpdateByAgent.get(agent) ?? now;
+      if (now - lastUpdateAt <= IDLE_NUDGE_WINDOW_MS) continue;
+
+      const key = `idle:${agent}`;
+      if (!shouldEscalate(key, now)) continue;
+
+      const content = `@${agent} idle nudge: no update in #general for 15m+. Post shipped / blocker / next+ETA now.`;
+      try {
+        await postMessage(url, "watchdog", "general", content);
+        ctx.log?.info?.(`[reflectt][watchdog] idle nudge fired for @${agent} (last=${lastUpdateAt})`);
+      } catch (err) {
+        ctx.log?.warn?.(`[reflectt][watchdog] idle nudge failed for @${agent}: ${err}`);
+      }
+    }
+  }, WATCHDOG_INTERVAL_MS);
+}
+
+function stopWatchdog() {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+}
+
 function handleInbound(data: string, url: string, account: ReflecttAccount, ctx: any) {
   try {
     const msg = JSON.parse(data);
@@ -147,6 +248,8 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
     const msgId: string = msg.id || "";
     const from: string = msg.from || "unknown";
     const channel: string = msg.channel || "general";
+
+    markAgentActivity(from, channel, msg.timestamp);
 
     if (!msgId) return;
     if (!dedup(msgId)) {
@@ -340,11 +443,16 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
         configured: true,
       });
 
+      seedAgentActivity(account.url, ctx.log).catch((err) => {
+        ctx.log?.warn?.(`[reflectt][watchdog] seed failed: ${err}`);
+      });
+      startWatchdog(account.url, ctx);
       connectSSE(account.url, account, ctx);
 
       return {
         stop: () => {
           stopped = true;
+          stopWatchdog();
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
           if (sseRequest) { sseRequest.destroy(); sseRequest = null; }
           ctx.log?.info("[reflectt] Stopped");
