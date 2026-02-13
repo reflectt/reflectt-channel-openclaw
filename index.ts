@@ -19,6 +19,8 @@ const ESCALATION_COOLDOWN_MS = 20 * 60 * 1000;
 
 const lastUpdateByAgent = new Map<string, number>();
 const lastEscalationAt = new Map<string, number>();
+const hasActiveTaskByAgent = new Map<string, { value: boolean; checkedAt: number }>();
+const TASK_CACHE_TTL_MS = 2 * 60 * 1000;
 
 // --- Config helpers ---
 
@@ -116,6 +118,30 @@ async function seedAgentActivity(url: string, log?: any) {
   }
 
   log?.info?.(`[reflectt][watchdog] seeded activity from ${messages.length} recent message(s)`);
+}
+
+async function hasActiveTask(url: string, agent: string, now = Date.now()): Promise<boolean> {
+  const cached = hasActiveTaskByAgent.get(agent);
+  if (cached && now - cached.checkedAt < TASK_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  try {
+    const response = await fetch(`${url}/tasks/next?agent=${encodeURIComponent(agent)}`);
+    if (!response.ok) {
+      hasActiveTaskByAgent.set(agent, { value: true, checkedAt: now });
+      return true;
+    }
+
+    const data = await response.json() as { task?: unknown };
+    const value = Boolean(data?.task);
+    hasActiveTaskByAgent.set(agent, { value, checkedAt: now });
+    return value;
+  } catch {
+    // fail-open so task API hiccups do not suppress legitimate nudges
+    hasActiveTaskByAgent.set(agent, { value: true, checkedAt: now });
+    return true;
+  }
 }
 
 // --- Dedup ---
@@ -219,6 +245,12 @@ function startWatchdog(url: string, ctx: any) {
     for (const agent of WATCHED_AGENTS) {
       const lastUpdateAt = lastUpdateByAgent.get(agent) ?? now;
       if (now - lastUpdateAt <= IDLE_NUDGE_WINDOW_MS) continue;
+
+      const activeTask = await hasActiveTask(url, agent, now);
+      if (!activeTask) {
+        ctx.log?.info?.(`[reflectt][watchdog] idle nudge suppressed for @${agent}: no active task`);
+        continue;
+      }
 
       const key = `idle:${agent}`;
       if (!shouldEscalate(key, now)) continue;
