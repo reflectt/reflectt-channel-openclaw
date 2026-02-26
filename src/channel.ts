@@ -327,12 +327,13 @@ async function handleChatMessage(
     // Route to each mentioned agent
     for (const agentId of mentionedAgents) {
       try {
-        // Resolve agent route
+        // Resolve agent route — all reflectt rooms share one session per agent.
+        // Room identity is preserved in To/OriginatingTo so replies route correctly.
         const route = runtime.channel.routing.resolveAgentRoute({
           cfg,
           channel: "reflectt",
           accountId: "default",
-          peer: { kind: "channel", id: channel },
+          peer: null,
         });
 
         // Build envelope-formatted body
