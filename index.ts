@@ -8,6 +8,9 @@
 import type { OpenClawPluginApi, ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import { DEFAULT_ACCOUNT_ID, buildChannelConfigSchema } from "openclaw/plugin-sdk";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
@@ -16,6 +19,12 @@ const WATCHED_SET = new Set<string>(WATCHED_AGENTS);
 const IDLE_NUDGE_WINDOW_MS = 15 * 60 * 1000; // 15m
 const WATCHDOG_INTERVAL_MS = 60 * 1000; // 1m
 const ESCALATION_COOLDOWN_MS = 20 * 60 * 1000;
+
+// SSE reconnect config
+const SSE_INITIAL_RETRY_MS = 1000;      // start at 1s
+const SSE_MAX_RETRY_MS = 30_000;        // cap at 30s
+const SSE_SOCKET_TIMEOUT_MS = 30_000;   // detect dead TCP after 30s silence
+const SSE_HEALTH_INTERVAL_MS = 15_000;  // health-check ping every 15s
 
 const lastUpdateByAgent = new Map<string, number>();
 const lastEscalationAt = new Map<string, number>();
@@ -29,6 +38,31 @@ interface ReflecttAccount {
   url: string;
   enabled: boolean;
   configured: boolean;
+}
+
+function purgeSessionIndexEntry(agentId: string, sessionKey: string, ctx: any): boolean {
+  try {
+    const storePath = path.join(os.homedir(), ".openclaw", "agents", agentId, "sessions", "sessions.json");
+    if (!fs.existsSync(storePath)) return false;
+
+    const raw = fs.readFileSync(storePath, "utf8");
+    const data = JSON.parse(raw || "{}");
+    const keyExact = sessionKey;
+    const keyLower = sessionKey.toLowerCase();
+
+    if (!Object.prototype.hasOwnProperty.call(data, keyExact) && !Object.prototype.hasOwnProperty.call(data, keyLower)) {
+      return false;
+    }
+
+    delete data[keyExact];
+    delete data[keyLower];
+    fs.writeFileSync(storePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+    ctx.log?.warn(`[reflectt] Purged stale session index entry for ${sessionKey} at ${storePath}`);
+    return true;
+  } catch (err) {
+    ctx.log?.error(`[reflectt] Failed to purge session entry for ${sessionKey}: ${err}`);
+    return false;
+  }
 }
 
 function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ReflecttAccount {
@@ -169,28 +203,61 @@ function incrementDispatchCount(messageId: string): number {
 
 let sseRequest: http.ClientRequest | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 let stopped = false;
 let pluginRuntime: any = null;
+let currentRetryMs = SSE_INITIAL_RETRY_MS;
+let lastSSEDataAt = 0;
+let sseConnected = false;
+
+function destroySSE(ctx: any, reason: string) {
+  if (sseRequest) {
+    ctx.log?.info(`[reflectt] Destroying SSE connection: ${reason}`);
+    try { sseRequest.destroy(); } catch {}
+    sseRequest = null;
+  }
+  sseConnected = false;
+}
 
 function connectSSE(url: string, account: ReflecttAccount, ctx: any) {
-  if (stopped || sseRequest) return;
+  if (stopped) return;
 
-  ctx.log?.info(`[reflectt] Connecting SSE: ${url}/events/subscribe`);
+  // Clean up any lingering connection
+  if (sseRequest) {
+    destroySSE(ctx, "new connection attempt");
+  }
+
+  ctx.log?.info(`[reflectt] Connecting SSE: ${url}/events/subscribe (retry backoff: ${currentRetryMs}ms)`);
 
   const req = http.get(`${url}/events/subscribe`, (res) => {
     if (res.statusCode !== 200) {
-      ctx.log?.error(`[reflectt] SSE ${res.statusCode}`);
+      ctx.log?.error(`[reflectt] SSE status ${res.statusCode}`);
       res.resume();
+      sseRequest = null;
       scheduleReconnect(url, account, ctx);
       return;
     }
+
+    // Connection succeeded — reset backoff
+    currentRetryMs = SSE_INITIAL_RETRY_MS;
+    sseConnected = true;
+    lastSSEDataAt = Date.now();
     ctx.log?.info("[reflectt] SSE connected ✓");
+
+    // Re-seed agent activity after reconnect
+    seedAgentActivity(url, ctx.log).catch((err) => {
+      ctx.log?.warn?.(`[reflectt] post-reconnect seed failed: ${err}`);
+    });
+
+    // NOTE: No socket timeout here — SSE streams are idle by nature.
+    // Staleness is detected by the periodic health-check pinger instead.
 
     let buffer = "";
     res.setEncoding("utf8");
 
     res.on("data", (chunk: string) => {
+      lastSSEDataAt = Date.now();
       buffer += chunk;
       const frames = buffer.split("\n\n");
       buffer = frames.pop() || "";
@@ -219,13 +286,24 @@ function connectSSE(url: string, account: ReflecttAccount, ctx: any) {
       }
     });
 
-    res.on("end", () => { sseRequest = null; scheduleReconnect(url, account, ctx); });
-    res.on("error", () => { sseRequest = null; scheduleReconnect(url, account, ctx); });
+    res.on("end", () => {
+      ctx.log?.warn("[reflectt] SSE stream ended by server");
+      sseRequest = null;
+      sseConnected = false;
+      scheduleReconnect(url, account, ctx);
+    });
+    res.on("error", (err) => {
+      ctx.log?.error(`[reflectt] SSE response error: ${err.message}`);
+      sseRequest = null;
+      sseConnected = false;
+      scheduleReconnect(url, account, ctx);
+    });
   });
 
   req.on("error", (err) => {
-    ctx.log?.error(`[reflectt] SSE error: ${err.message}`);
+    ctx.log?.error(`[reflectt] SSE connect error: ${err.message}`);
     sseRequest = null;
+    sseConnected = false;
     scheduleReconnect(url, account, ctx);
   });
 
@@ -234,7 +312,58 @@ function connectSSE(url: string, account: ReflecttAccount, ctx: any) {
 
 function scheduleReconnect(url: string, account: ReflecttAccount, ctx: any) {
   if (stopped || reconnectTimer) return;
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; connectSSE(url, account, ctx); }, 5000);
+
+  // Exponential backoff with jitter
+  const jitter = Math.random() * currentRetryMs * 0.3;
+  const delay = Math.min(currentRetryMs + jitter, SSE_MAX_RETRY_MS);
+  ctx.log?.info(`[reflectt] Reconnecting in ${Math.round(delay)}ms`);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectSSE(url, account, ctx);
+  }, delay);
+
+  // Increase backoff for next attempt
+  currentRetryMs = Math.min(currentRetryMs * 2, SSE_MAX_RETRY_MS);
+}
+
+/**
+ * Periodic health-check: ping /health to detect server availability
+ * even when the SSE socket hasn't timed out yet. If the server is up
+ * but we're not connected, force a reconnect.
+ */
+function startHealthCheck(url: string, account: ReflecttAccount, ctx: any) {
+  if (healthCheckTimer) return;
+
+  healthCheckTimer = setInterval(async () => {
+    if (stopped) return;
+
+    try {
+      const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+      if (res.ok) {
+        // Server is alive
+        if (!sseConnected && !reconnectTimer) {
+          ctx.log?.warn("[reflectt] Health OK but SSE not connected — forcing reconnect");
+          currentRetryMs = SSE_INITIAL_RETRY_MS; // reset backoff since server is up
+          connectSSE(url, account, ctx);
+        }
+      }
+    } catch {
+      // Server unreachable — SSE reconnect loop will handle it
+      if (sseConnected) {
+        ctx.log?.warn("[reflectt] Health check failed while SSE appears connected — destroying stale connection");
+        destroySSE(ctx, "health check failed");
+        scheduleReconnect(url, account, ctx);
+      }
+    }
+  }, SSE_HEALTH_INTERVAL_MS);
+}
+
+function stopHealthCheck() {
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+    healthCheckTimer = null;
+  }
 }
 
 function startWatchdog(url: string, ctx: any) {
@@ -281,6 +410,8 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
     const from: string = msg.from || "unknown";
     const channel: string = msg.channel || "general";
 
+    // Re-enabled by operator request: system/watchdog messages should be dispatch-eligible.
+    // Keep activity tracking consistent for all senders.
     markAgentActivity(from, channel, msg.timestamp);
 
     if (!msgId) return;
@@ -320,6 +451,7 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
     let skippedSelfMentions = 0;
     let unmatchedMentions = 0;
     const dispatchedTargets: string[] = [];
+    const dispatchedSet = new Set<string>();
 
     for (const mention of mentions) {
       let agentId: string | undefined;
@@ -341,7 +473,13 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
         continue;
       }
 
+      if (dispatchedSet.has(agentId)) {
+        ctx.log?.debug(`[reflectt] Skipping duplicate mention target: @${agentId}`);
+        continue;
+      }
+
       matchedMentions += 1;
+      dispatchedSet.add(agentId);
       ctx.log?.info(`[reflectt] ${from} → @${agentId}: ${content.slice(0, 60)}...`);
 
       // Build inbound message context
@@ -377,6 +515,18 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       // Finalize context
       const finalizedCtx = runtime.channel.reply.finalizeInboundContext(msgContext);
 
+      // Guard against stale/unsafe session path metadata leaking from prior context.
+      // OpenClaw now enforces that any session file path must be under the agent sessions dir.
+      const safeCtx: any = { ...finalizedCtx };
+      delete safeCtx.SessionFilePath;
+      delete safeCtx.sessionFilePath;
+      delete safeCtx.SessionPath;
+      delete safeCtx.sessionPath;
+      delete safeCtx.TranscriptPath;
+      delete safeCtx.transcriptPath;
+      delete safeCtx.SessionFile;
+      delete safeCtx.sessionFile;
+
       // Create reply dispatcher
       const agentName = agentId === "main" ? "kai" : agentId;
       const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
@@ -400,11 +550,27 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       );
 
       runtime.channel.reply.dispatchReplyFromConfig({
-        ctx: finalizedCtx,
+        ctx: safeCtx,
         cfg,
         dispatcher: dispatcher.dispatcher,
         replyOptions: dispatcher.replyOptions,
       }).catch((err: unknown) => {
+        const errText = String(err ?? "");
+        if (errText.includes("Session file path must be within sessions directory")) {
+          const healed = purgeSessionIndexEntry(agentId!, sessionKey, ctx);
+          if (healed) {
+            ctx.log?.warn(`[reflectt] Retrying dispatch after purging stale session entry: ${sessionKey}`);
+            runtime.channel.reply.dispatchReplyFromConfig({
+              ctx: safeCtx,
+              cfg,
+              dispatcher: dispatcher.dispatcher,
+              replyOptions: dispatcher.replyOptions,
+            }).catch((retryErr: unknown) => {
+              ctx.log?.error(`[reflectt] dispatch retry failed: ${retryErr}`);
+            });
+            return;
+          }
+        }
         ctx.log?.error(`[reflectt] dispatchReplyFromConfig error: ${err}`);
       });
     }
@@ -479,14 +645,16 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
         ctx.log?.warn?.(`[reflectt][watchdog] seed failed: ${err}`);
       });
       startWatchdog(account.url, ctx);
+      startHealthCheck(account.url, account, ctx);
       connectSSE(account.url, account, ctx);
 
       return {
         stop: () => {
           stopped = true;
           stopWatchdog();
+          stopHealthCheck();
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-          if (sseRequest) { sseRequest.destroy(); sseRequest = null; }
+          destroySSE(ctx, "plugin stopped");
           ctx.log?.info("[reflectt] Stopped");
         },
       };
