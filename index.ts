@@ -486,7 +486,9 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       const runtime = pluginRuntime;
       if (!runtime?.channel?.reply) continue;
 
-      const sessionKey = `agent:${agentId}:reflectt:channel:${channel}`;
+      // All reflectt rooms share one session per agent (peer: null).
+      // Room identity is preserved in OriginatingTo so replies route correctly.
+      const sessionKey = `agent:${agentId}:reflectt:main`;
       
       // Create message context
       const msgContext = {
