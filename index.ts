@@ -8,17 +8,84 @@
 import type { OpenClawPluginApi, ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
 import { DEFAULT_ACCOUNT_ID, buildChannelConfigSchema } from "openclaw/plugin-sdk";
 import http from "node:http";
+import https from "node:https";
+
+function httpModule(url: string): typeof http | typeof https {
+  return url.startsWith("https") ? https : http;
+}
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
-const WATCHED_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
-const WATCHED_SET = new Set<string>(WATCHED_AGENTS);
+const FALLBACK_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
 const IDLE_NUDGE_WINDOW_MS = 15 * 60 * 1000; // 15m
 const WATCHDOG_INTERVAL_MS = 60 * 1000; // 1m
 const ESCALATION_COOLDOWN_MS = 20 * 60 * 1000;
+const AGENT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // refresh team roles every 5m
+
+// Dynamic agent roster — populated from /team/roles, falls back to FALLBACK_AGENTS
+const discoveredAgents = new Set<string>(FALLBACK_AGENTS);
+const agentAliases = new Map<string, string>(); // alias → canonical agent name
+let lastAgentRefreshAt = 0;
+let agentRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+async function refreshAgentRoster(url: string, log?: any): Promise<void> {
+  try {
+    const response = await fetch(`${url}/team/roles`, { signal: AbortSignal.timeout(5000) });
+    if (!response.ok) {
+      log?.warn?.(`[reflectt][roster] /team/roles returned ${response.status}`);
+      return;
+    }
+    const data = await response.json() as any;
+    const agents: Array<{ name?: string; agent?: string; aliases?: string[] }> =
+      data?.agents ?? data?.roles ?? (Array.isArray(data) ? data : []);
+
+    if (agents.length === 0) return;
+
+    const newNames = new Set<string>();
+    const newAliases = new Map<string, string>();
+
+    for (const a of agents) {
+      const name = (a.name || a.agent || "").toLowerCase().trim();
+      if (!name) continue;
+      newNames.add(name);
+      // Register aliases
+      if (Array.isArray(a.aliases)) {
+        for (const alias of a.aliases) {
+          const normalized = String(alias).toLowerCase().trim();
+          if (normalized && normalized !== name) {
+            newAliases.set(normalized, name);
+          }
+        }
+      }
+    }
+
+    // Merge — never remove agents mid-session, only add
+    for (const name of newNames) discoveredAgents.add(name);
+    for (const [alias, canonical] of newAliases) agentAliases.set(alias, canonical);
+
+    lastAgentRefreshAt = Date.now();
+    log?.info?.(`[reflectt][roster] refreshed: ${newNames.size} agents from /team/roles (total tracked: ${discoveredAgents.size})`);
+  } catch (err) {
+    log?.warn?.(`[reflectt][roster] refresh failed: ${err}`);
+  }
+}
+
+function startAgentRefresh(url: string, log?: any) {
+  if (agentRefreshTimer) return;
+  agentRefreshTimer = setInterval(() => {
+    refreshAgentRoster(url, log).catch(() => {});
+  }, AGENT_REFRESH_INTERVAL_MS);
+}
+
+function stopAgentRefresh() {
+  if (agentRefreshTimer) {
+    clearInterval(agentRefreshTimer);
+    agentRefreshTimer = null;
+  }
+}
 
 // SSE reconnect config
 const SSE_INITIAL_RETRY_MS = 1000;      // start at 1s
@@ -67,6 +134,19 @@ function purgeSessionIndexEntry(agentId: string, sessionKey: string, ctx: any): 
 
 function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ReflecttAccount {
   const ch = (cfg as any)?.channels?.reflectt ?? {};
+
+  // Support multi-host via accounts map: { "default": { url: "..." }, "backoffice": { url: "..." } }
+  const accounts = ch.accounts as Record<string, { url?: string; enabled?: boolean }> | undefined;
+  if (accounts && accountId && accounts[accountId]) {
+    const acct = accounts[accountId];
+    return {
+      accountId,
+      url: acct.url || DEFAULT_URL,
+      enabled: acct.enabled !== false,
+      configured: true,
+    };
+  }
+
   return {
     accountId: accountId || DEFAULT_ACCOUNT_ID,
     url: ch.url || DEFAULT_URL,
@@ -75,15 +155,24 @@ function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): Reflect
   };
 }
 
+function listAllAccountIds(cfg: OpenClawConfig): string[] {
+  const ch = (cfg as any)?.channels?.reflectt ?? {};
+  const accounts = ch.accounts as Record<string, any> | undefined;
+  if (accounts) {
+    return Object.keys(accounts);
+  }
+  return [DEFAULT_ACCOUNT_ID];
+}
+
 // --- HTTP helpers ---
 
 function postMessage(url: string, from: string, channel: string, content: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ from, channel, content });
     const parsed = new URL(`${url}/chat/messages`);
-    const req = http.request({
+    const req = httpModule(url).request({
       hostname: parsed.hostname,
-      port: parsed.port,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : undefined),
       path: parsed.pathname,
       method: "POST",
       headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
@@ -102,7 +191,7 @@ function normalizeSenderId(value: unknown): string | null {
 function markAgentActivity(from: unknown, channel: unknown, timestamp: unknown) {
   if (channel !== "general") return;
   const id = normalizeSenderId(from);
-  if (!id || !WATCHED_SET.has(id)) return;
+  if (!id || !discoveredAgents.has(id)) return;
   const ts =
     typeof timestamp === "number" && Number.isFinite(timestamp)
       ? timestamp
@@ -141,8 +230,11 @@ async function fetchRecentMessages(url: string): Promise<Array<Record<string, un
 }
 
 async function seedAgentActivity(url: string, log?: any) {
+  // Refresh roster before seeding so we track all known agents
+  await refreshAgentRoster(url, log).catch(() => {});
+
   const now = Date.now();
-  for (const agent of WATCHED_AGENTS) {
+  for (const agent of discoveredAgents) {
     lastUpdateByAgent.set(agent, now);
   }
 
@@ -230,7 +322,7 @@ function connectSSE(url: string, account: ReflecttAccount, ctx: any) {
 
   ctx.log?.info(`[reflectt] Connecting SSE: ${url}/events/subscribe (retry backoff: ${currentRetryMs}ms)`);
 
-  const req = http.get(`${url}/events/subscribe`, (res) => {
+  const req = httpModule(url).get(`${url}/events/subscribe`, (res) => {
     if (res.statusCode !== 200) {
       ctx.log?.error(`[reflectt] SSE status ${res.statusCode}`);
       res.resume();
@@ -371,7 +463,7 @@ function startWatchdog(url: string, ctx: any) {
 
   watchdogTimer = setInterval(async () => {
     const now = Date.now();
-    for (const agent of WATCHED_AGENTS) {
+    for (const agent of discoveredAgents) {
       const lastUpdateAt = lastUpdateByAgent.get(agent) ?? now;
       if (now - lastUpdateAt <= IDLE_NUDGE_WINDOW_MS) continue;
 
@@ -422,7 +514,7 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
 
     // Extract @mentions
     const mentions: string[] = [];
-    const regex = /@(\w+)/g;
+    const regex = /@([\w-]+)/g;
     let match: RegExpExecArray | null;
     while ((match = regex.exec(content)) !== null) mentions.push(match[1].toLowerCase());
     if (mentions.length === 0) return;
@@ -460,6 +552,10 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
         if (a.identity?.name?.toLowerCase() === mention) { agentId = a.id; break; }
       }
       if (!agentId && mention === "kai") agentId = "main";
+      // Check discovered agents from /team/roles if not in openclaw config
+      if (!agentId && discoveredAgents.has(mention)) agentId = mention;
+      // Check aliases
+      if (!agentId && agentAliases.has(mention)) agentId = agentAliases.get(mention)!;
       if (!agentId) {
         unmatchedMentions += 1;
         ctx.log?.debug(`[reflectt] Mention @${mention} did not match any agent`);
@@ -605,7 +701,10 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
   reload: { configPrefixes: ["channels.reflectt"] },
 
   config: {
-    listAccountIds: () => [DEFAULT_ACCOUNT_ID],
+    listAccountIds: () => {
+      const cfg = pluginRuntime?.config?.loadConfig?.() ?? {};
+      return listAllAccountIds(cfg);
+    },
     resolveAccount: (cfg, accountId) => resolveAccount(cfg, accountId),
     defaultAccountId: () => DEFAULT_ACCOUNT_ID,
     isConfigured: (account) => account.configured,
@@ -643,16 +742,31 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
         configured: true,
       });
 
-      seedAgentActivity(account.url, ctx.log).catch((err) => {
-        ctx.log?.warn?.(`[reflectt][watchdog] seed failed: ${err}`);
-      });
+      // Connect to all configured accounts (multi-host support)
+      const cfg = pluginRuntime?.config?.loadConfig?.() ?? {};
+      const allIds = listAllAccountIds(cfg);
+      const allAccounts = allIds.map(id => resolveAccount(cfg, id)).filter(a => a.enabled);
+
+      for (const acct of allAccounts) {
+        ctx.log?.info(`[reflectt] Connecting to ${acct.accountId} at ${acct.url}`);
+        seedAgentActivity(acct.url, ctx.log).catch((err) => {
+          ctx.log?.warn?.(`[reflectt][watchdog] seed failed for ${acct.accountId}: ${err}`);
+        });
+      }
+      // Primary account gets watchdog, agent refresh, health check
+      startAgentRefresh(account.url, ctx.log);
       startWatchdog(account.url, ctx);
       startHealthCheck(account.url, account, ctx);
-      connectSSE(account.url, account, ctx);
+
+      // Connect SSE to all accounts
+      for (const acct of allAccounts) {
+        connectSSE(acct.url, acct, ctx);
+      }
 
       return {
         stop: () => {
           stopped = true;
+          stopAgentRefresh();
           stopWatchdog();
           stopHealthCheck();
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
