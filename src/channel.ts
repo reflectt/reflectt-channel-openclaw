@@ -4,6 +4,27 @@ import type { ResolvedReflecttAccount, ReflecttConfig } from "./types.js";
 
 const DEFAULT_REFLECTT_URL = "http://localhost:4445";
 
+// ── SSE singleton guard ────────────────────────────────────────────────────
+// Ensures only one active SSE connection exists at a time.
+// Without this, each startAccount call (config reload, server restart) stacks
+// a new SSE listener on top of existing ones — causing N-times delivery.
+let _activeSseController: AbortController | null = null;
+
+function acquireSseSlot(): AbortController {
+  if (_activeSseController) {
+    _activeSseController.abort();
+  }
+  _activeSseController = new AbortController();
+  return _activeSseController;
+}
+
+function releaseSseSlot(controller: AbortController): void {
+  if (_activeSseController === controller) {
+    _activeSseController = null;
+  }
+}
+// ──────────────────────────────────────────────────────────────────────────
+
 const WATCHED_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
 const WATCHED_SET = new Set<string>(WATCHED_AGENTS);
 
@@ -181,6 +202,18 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
       
       log?.info?.(`Starting reflectt channel monitor: ${account.url}`);
 
+      // ── Acquire exclusive SSE slot ─────────────────────────────────────────
+      // Cancels any previously-running SSE connection from a prior startAccount
+      // invocation (config reload / server restart) before starting a new one.
+      const sseController = acquireSseSlot();
+      // Merge caller's abortSignal with our singleton controller
+      const mergedSignal = AbortSignal.any
+        ? AbortSignal.any([abortSignal, sseController.signal])
+        : sseController.signal;
+
+      abortSignal.addEventListener("abort", () => releaseSseSlot(sseController));
+      // ─────────────────────────────────────────────────────────────────────
+
       const watchdogState: WatchdogState = {
         lastUpdateByAgent: new Map(),
         lastEscalationAt: new Map(),
@@ -211,7 +244,7 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
         }
       }, WATCHDOG_INTERVAL_MS);
 
-      abortSignal.addEventListener("abort", () => {
+      mergedSignal.addEventListener("abort", () => {
         clearInterval(watchdogTimer);
       });
 
@@ -219,7 +252,7 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
       const connectSSE = async () => {
         try {
           const response = await fetch(`${account.url}/events`, {
-            signal: abortSignal,
+            signal: mergedSignal,
           });
 
           if (!response.ok) {
@@ -235,7 +268,7 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
 
           let buffer = "";
 
-          while (!abortSignal.aborted) {
+          while (!mergedSignal.aborted) {
             const { done, value } = await reader.read();
 
             if (done) break;
@@ -276,7 +309,7 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
             }
           }
         } catch (error) {
-          if (abortSignal.aborted) {
+          if (mergedSignal.aborted) {
             log?.info?.("SSE connection closed (aborted)");
             return;
           }
@@ -284,9 +317,9 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
           log?.error?.(`SSE connection error: ${error}`);
 
           // Retry after delay if not aborted
-          if (!abortSignal.aborted) {
+          if (!mergedSignal.aborted) {
             await new Promise((resolve) => setTimeout(resolve, 5000));
-            if (!abortSignal.aborted) {
+            if (!mergedSignal.aborted) {
               log?.info?.("Reconnecting to reflectt SSE stream...");
               await connectSSE();
             }
