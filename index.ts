@@ -798,10 +798,6 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
             usageSeenSeqs.add(evt.seq);
           }
           const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
-          // Debug: log first 10 events to /tmp for token count diagnosis
-          if (usageSeenSeqs.size <= 10) {
-            try { fs.appendFileSync("/tmp/reflectt-usage-debug.log", JSON.stringify({ seq: evt.seq, agent: agentId, usage: evt.usage, lastCallUsage: evt.lastCallUsage, costUsd: evt.costUsd, context: evt.context, durationMs: evt.durationMs }) + "\n"); } catch {}
-          }
           if (!agentId) return;
 
           const cumulative = evt.usage || {};
@@ -811,26 +807,29 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
           let inputTokens: number;
           let outputTokens: number;
 
-          if (lastCall && (lastCall.input > 0 || lastCall.output > 0)) {
-            // Per-call data available — use it directly
-            inputTokens = lastCall.input || 0;
+          // Use lastCallUsage when available (per-call), else delta from cumulative
+          const src = lastCall || cumulative;
+          if (lastCall) {
+            inputTokens = (lastCall.input || 0) + (lastCall.cacheRead || 0) + (lastCall.cacheWrite || 0);
             outputTokens = lastCall.output || 0;
           } else {
-            // Compute delta from cumulative totals
             const prev = lastSeen.get(sessionKey) || { input: 0, output: 0 };
-            const curInput = cumulative.input || cumulative.promptTokens || 0;
+            const curInput = (cumulative.input || 0) + (cumulative.cacheRead || 0) + (cumulative.cacheWrite || 0);
             const curOutput = cumulative.output || 0;
             inputTokens = Math.max(0, curInput - prev.input);
             outputTokens = Math.max(0, curOutput - prev.output);
           }
 
-          // Update cumulative tracker
+          // Update cumulative tracker (include cache in input total)
           lastSeen.set(sessionKey, {
-            input: cumulative.input || cumulative.promptTokens || 0,
+            input: (cumulative.input || 0) + (cumulative.cacheRead || 0) + (cumulative.cacheWrite || 0),
             output: cumulative.output || 0,
           });
 
           if (inputTokens === 0 && outputTokens === 0) return;
+
+          const cacheRead = src.cacheRead || 0;
+          const cacheWrite = src.cacheWrite || 0;
 
           const body = JSON.stringify({
             agent: agentId,
@@ -844,8 +843,11 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
             metadata: {
               source: "reflectt-channel-plugin",
               session_key: sessionKey,
-              cache_read: (lastCall || cumulative).cacheRead || 0,
-              cache_write: (lastCall || cumulative).cacheWrite || 0,
+              cache_read: cacheRead,
+              cache_write: cacheWrite,
+              cache_read_tokens: cacheRead,
+              cache_write_tokens: cacheWrite,
+              raw_input_tokens: src.input || 0,
               duration_ms: evt.durationMs,
             },
           });
