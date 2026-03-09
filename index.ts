@@ -19,6 +19,17 @@ import path from "node:path";
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
+/** Extract agent ID from OpenClaw session key (e.g., "agent:link:reflectt:main" → "link") */
+function extractAgentFromSessionKey(key: string): string | null {
+  if (!key) return null;
+  const parts = key.split(":");
+  // Format: "agent:<agentId>:<channel>:<room>" or "agent:<agentId>:<room>"
+  if (parts[0] === "agent" && parts.length >= 2 && parts[1]) {
+    return parts[1];
+  }
+  return null;
+}
+
 const FALLBACK_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
 const IDLE_NUDGE_WINDOW_MS = 15 * 60 * 1000; // 15m
 const WATCHDOG_INTERVAL_MS = 60 * 1000; // 1m
@@ -763,12 +774,61 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
         connectSSE(acct.url, acct, ctx);
       }
 
+      // ── Usage reporting: forward model.usage diagnostic events to reflectt-node ──
+      let unsubUsage: (() => void) | null = null;
+      try {
+        const { onDiagnosticEvent } = await import("openclaw/plugin-sdk") as any;
+        if (typeof onDiagnosticEvent === "function") {
+          const primaryUrl = account.url;
+          unsubUsage = onDiagnosticEvent((evt: any) => {
+            if (evt.type !== "model.usage") return;
+            const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
+            if (!agentId) return;
+
+            const usage = evt.lastCallUsage || evt.usage || {};
+            const inputTokens = usage.input || usage.promptTokens || 0;
+            const outputTokens = usage.output || 0;
+            if (inputTokens === 0 && outputTokens === 0) return;
+
+            const body = JSON.stringify({
+              agent: agentId,
+              model: evt.model || "unknown",
+              provider: evt.provider || "unknown",
+              input_tokens: inputTokens,
+              output_tokens: outputTokens,
+              estimated_cost_usd: evt.costUsd ?? undefined,
+              category: "chat",
+              timestamp: evt.ts || Date.now(),
+              metadata: {
+                source: "reflectt-channel-plugin",
+                session_key: evt.sessionKey,
+                cache_read: usage.cacheRead || 0,
+                cache_write: usage.cacheWrite || 0,
+                duration_ms: evt.durationMs,
+              },
+            });
+
+            const req = httpModule(primaryUrl).request(
+              `${primaryUrl}/usage/report`,
+              { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }, timeout: 5000 },
+              (res) => { res.resume(); }, // drain response
+            );
+            req.on("error", () => {}); // non-blocking, swallow errors
+            req.end(body);
+          });
+          ctx.log?.info("[reflectt] Usage reporting: subscribed to model.usage diagnostic events");
+        }
+      } catch {
+        ctx.log?.warn?.("[reflectt] Usage reporting: onDiagnosticEvent not available (OpenClaw version may be too old)");
+      }
+
       return {
         stop: () => {
           stopped = true;
           stopAgentRefresh();
           stopWatchdog();
           stopHealthCheck();
+          if (unsubUsage) { unsubUsage(); unsubUsage = null; }
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
           destroySSE(ctx, "plugin stopped");
           ctx.log?.info("[reflectt] Stopped");
