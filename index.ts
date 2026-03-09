@@ -798,6 +798,10 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
             usageSeenSeqs.add(evt.seq);
           }
           const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
+          // Debug: log first 10 events to /tmp for token count diagnosis
+          if (usageSeenSeqs.size <= 10) {
+            try { fs.appendFileSync("/tmp/reflectt-usage-debug.log", JSON.stringify({ seq: evt.seq, agent: agentId, usage: evt.usage, lastCallUsage: evt.lastCallUsage, costUsd: evt.costUsd, context: evt.context, durationMs: evt.durationMs }) + "\n"); } catch {}
+          }
           if (!agentId) return;
 
           const cumulative = evt.usage || {};
