@@ -42,6 +42,8 @@ const agentAliases = new Map<string, string>(); // alias → canonical agent nam
 let lastAgentRefreshAt = 0;
 let agentRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let usageHookActive = false; // global guard — onDiagnosticEvent is process-wide, subscribe once
+const usageSeenSeqs = new Set<number>(); // dedup: diagnostic events can fire multiple times per seq
+let usageSeenCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 async function refreshAgentRoster(url: string, log?: any): Promise<void> {
   try {
@@ -784,8 +786,17 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
         // Track last seen cumulative totals per session to compute per-call deltas
         const lastSeen = new Map<string, { input: number; output: number }>();
         usageHookActive = true;
+        // Periodic cleanup of seen seqs (keep last 5 minutes)
+        usageSeenCleanupTimer = setInterval(() => {
+          if (usageSeenSeqs.size > 10000) usageSeenSeqs.clear();
+        }, 300_000);
         unsubUsage = onDiagnosticEvent((evt: any) => {
           if (evt.type !== "model.usage") return;
+          // Dedup by seq number — same event can fire multiple times
+          if (typeof evt.seq === "number") {
+            if (usageSeenSeqs.has(evt.seq)) return;
+            usageSeenSeqs.add(evt.seq);
+          }
           const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
           if (!agentId) return;
 
@@ -851,7 +862,8 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
           stopAgentRefresh();
           stopWatchdog();
           stopHealthCheck();
-          if (unsubUsage) { unsubUsage(); unsubUsage = null; usageHookActive = false; }
+          if (unsubUsage) { unsubUsage(); unsubUsage = null; usageHookActive = false; usageSeenSeqs.clear(); }
+          if (usageSeenCleanupTimer) { clearInterval(usageSeenCleanupTimer); usageSeenCleanupTimer = null; }
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
           destroySSE(ctx, "plugin stopped");
           ctx.log?.info("[reflectt] Stopped");
