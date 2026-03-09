@@ -4,6 +4,23 @@ import type { ResolvedReflecttAccount, ReflecttConfig } from "./types.js";
 
 const DEFAULT_REFLECTT_URL = "http://localhost:4445";
 
+// ── GitHub mention remapping ───────────────────────────────────────────────
+// Shared GitHub accounts (e.g. itskai-dev) show as @itskaidev in webhook
+// messages. Remap to the correct agent name before routing to sessions.
+const GITHUB_MENTION_REMAP: Record<string, string> = {
+  itskaidev: "kai",
+  "itskai-dev": "kai",
+};
+
+function remapGitHubMentions(text: string): string {
+  if (!text) return text;
+  let result = text;
+  for (const [githubUser, agentName] of Object.entries(GITHUB_MENTION_REMAP)) {
+    result = result.replace(new RegExp(`@${githubUser}\\b`, "gi"), `@${agentName}`);
+  }
+  return result;
+}
+
 // ── SSE singleton guard ────────────────────────────────────────────────────
 // Ensures only one active SSE connection exists at a time.
 // Without this, each startAccount call (config reload, server restart) stacks
@@ -344,7 +361,9 @@ async function handleChatMessage(
 ) {
   try {
     const { from, channel, content, timestamp, id } = message;
-    const safeContent = typeof content === "string" ? content : "";
+    const rawContent = typeof content === "string" ? content : "";
+    // Remap shared GitHub account mentions (e.g. @itskaidev → @kai)
+    const safeContent = remapGitHubMentions(rawContent);
     const safeChannel = typeof channel === "string" ? channel : "general";
 
     // Check if message mentions an agent
