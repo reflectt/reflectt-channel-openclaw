@@ -41,6 +41,7 @@ const discoveredAgents = new Set<string>(FALLBACK_AGENTS);
 const agentAliases = new Map<string, string>(); // alias → canonical agent name
 let lastAgentRefreshAt = 0;
 let agentRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let usageHookActive = false; // global guard — onDiagnosticEvent is process-wide, subscribe once
 
 async function refreshAgentRoster(url: string, log?: any): Promise<void> {
   try {
@@ -775,51 +776,73 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
       }
 
       // ── Usage reporting: forward model.usage diagnostic events to reflectt-node ──
+      // onDiagnosticEvent is global (not per-account), so only subscribe once.
       let unsubUsage: (() => void) | null = null;
-      try {
-        if (typeof onDiagnosticEvent === "function") {
-          const primaryUrl = account.url;
-          ctx.log?.info(`[reflectt] Usage reporting: hooking onDiagnosticEvent, posting to ${primaryUrl}/usage/report`);
-          unsubUsage = onDiagnosticEvent((evt: any) => {
-            if (evt.type !== "model.usage") return;
-            const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
-            if (!agentId) return;
+      if (!usageHookActive && typeof onDiagnosticEvent === "function") {
+        const primaryUrl = account.url;
+        ctx.log?.info(`[reflectt] Usage reporting: hooking onDiagnosticEvent → ${primaryUrl}/usage/report`);
+        // Track last seen cumulative totals per session to compute per-call deltas
+        const lastSeen = new Map<string, { input: number; output: number }>();
+        usageHookActive = true;
+        unsubUsage = onDiagnosticEvent((evt: any) => {
+          if (evt.type !== "model.usage") return;
+          const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
+          if (!agentId) return;
 
-            const usage = evt.lastCallUsage || evt.usage || {};
-            const inputTokens = usage.input || usage.promptTokens || 0;
-            const outputTokens = usage.output || 0;
-            if (inputTokens === 0 && outputTokens === 0) return;
+          const cumulative = evt.usage || {};
+          const lastCall = evt.lastCallUsage;
+          const sessionKey = evt.sessionKey || "unknown";
 
-            const body = JSON.stringify({
-              agent: agentId,
-              model: evt.model || "unknown",
-              provider: evt.provider || "unknown",
-              input_tokens: inputTokens,
-              output_tokens: outputTokens,
-              estimated_cost_usd: evt.costUsd ?? undefined,
-              category: "chat",
-              timestamp: evt.ts || Date.now(),
-              metadata: {
-                source: "reflectt-channel-plugin",
-                session_key: evt.sessionKey,
-                cache_read: usage.cacheRead || 0,
-                cache_write: usage.cacheWrite || 0,
-                duration_ms: evt.durationMs,
-              },
-            });
+          let inputTokens: number;
+          let outputTokens: number;
 
-            const req = httpModule(primaryUrl).request(
-              `${primaryUrl}/usage/report`,
-              { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }, timeout: 5000 },
-              (res) => { res.resume(); }, // drain response
-            );
-            req.on("error", () => {}); // non-blocking, swallow errors
-            req.end(body);
+          if (lastCall && (lastCall.input > 0 || lastCall.output > 0)) {
+            // Per-call data available — use it directly
+            inputTokens = lastCall.input || 0;
+            outputTokens = lastCall.output || 0;
+          } else {
+            // Compute delta from cumulative totals
+            const prev = lastSeen.get(sessionKey) || { input: 0, output: 0 };
+            const curInput = cumulative.input || cumulative.promptTokens || 0;
+            const curOutput = cumulative.output || 0;
+            inputTokens = Math.max(0, curInput - prev.input);
+            outputTokens = Math.max(0, curOutput - prev.output);
+          }
+
+          // Update cumulative tracker
+          lastSeen.set(sessionKey, {
+            input: cumulative.input || cumulative.promptTokens || 0,
+            output: cumulative.output || 0,
           });
-          ctx.log?.info("[reflectt] Usage reporting: subscribed to model.usage diagnostic events");
-        }
-      } catch (usageErr) {
-        ctx.log?.warn?.(`[reflectt] Usage reporting: failed to initialize: ${usageErr}`);
+
+          if (inputTokens === 0 && outputTokens === 0) return;
+
+          const body = JSON.stringify({
+            agent: agentId,
+            model: evt.model || "unknown",
+            provider: evt.provider || "unknown",
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            estimated_cost_usd: evt.costUsd ?? undefined,
+            category: "chat",
+            timestamp: evt.ts || Date.now(),
+            metadata: {
+              source: "reflectt-channel-plugin",
+              session_key: sessionKey,
+              cache_read: (lastCall || cumulative).cacheRead || 0,
+              cache_write: (lastCall || cumulative).cacheWrite || 0,
+              duration_ms: evt.durationMs,
+            },
+          });
+
+          const req = httpModule(primaryUrl).request(
+            `${primaryUrl}/usage/report`,
+            { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }, timeout: 5000 },
+            (res) => { res.resume(); },
+          );
+          req.on("error", () => {});
+          req.end(body);
+        });
       }
 
       return {
@@ -828,7 +851,7 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
           stopAgentRefresh();
           stopWatchdog();
           stopHealthCheck();
-          if (unsubUsage) { unsubUsage(); unsubUsage = null; }
+          if (unsubUsage) { unsubUsage(); unsubUsage = null; usageHookActive = false; }
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
           destroySSE(ctx, "plugin stopped");
           ctx.log?.info("[reflectt] Stopped");
