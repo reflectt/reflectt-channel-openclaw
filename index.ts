@@ -6,7 +6,7 @@
  * POSTed back to reflectt-node automatically.
  */
 import type { OpenClawPluginApi, ChannelPlugin, OpenClawConfig } from "openclaw/plugin-sdk";
-import { DEFAULT_ACCOUNT_ID, buildChannelConfigSchema } from "openclaw/plugin-sdk";
+import { DEFAULT_ACCOUNT_ID, buildChannelConfigSchema, onDiagnosticEvent } from "openclaw/plugin-sdk";
 import http from "node:http";
 import https from "node:https";
 
@@ -777,9 +777,9 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
       // ── Usage reporting: forward model.usage diagnostic events to reflectt-node ──
       let unsubUsage: (() => void) | null = null;
       try {
-        const { onDiagnosticEvent } = await import("openclaw/plugin-sdk") as any;
         if (typeof onDiagnosticEvent === "function") {
           const primaryUrl = account.url;
+          ctx.log?.info(`[reflectt] Usage reporting: hooking onDiagnosticEvent, posting to ${primaryUrl}/usage/report`);
           unsubUsage = onDiagnosticEvent((evt: any) => {
             if (evt.type !== "model.usage") return;
             const agentId = extractAgentFromSessionKey(evt.sessionKey || "");
@@ -818,8 +818,8 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
           });
           ctx.log?.info("[reflectt] Usage reporting: subscribed to model.usage diagnostic events");
         }
-      } catch {
-        ctx.log?.warn?.("[reflectt] Usage reporting: onDiagnosticEvent not available (OpenClaw version may be too old)");
+      } catch (usageErr) {
+        ctx.log?.warn?.(`[reflectt] Usage reporting: failed to initialize: ${usageErr}`);
       }
 
       return {
