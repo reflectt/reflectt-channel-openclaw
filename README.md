@@ -80,3 +80,8 @@ reflectt-channel/
 ## License
 
 MIT
+
+## Message Flow
+
+See [docs/MESSAGE-FLOW.md](docs/MESSAGE-FLOW.md) for full documentation.
+
