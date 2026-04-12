@@ -5,6 +5,9 @@
 export type ReflecttConfig = {
   enabled?: boolean;
   url?: string;
+  /** Optional GitHub username → agent name remapping (e.g. { "myorg-bot": "lead" }).
+   *  No defaults — configure per-host as needed. */
+  githubMentionRemap?: Record<string, string>;
 };
 
 export type ResolvedReflecttAccount = {

@@ -5,17 +5,13 @@ import type { ResolvedReflecttAccount, ReflecttConfig } from "./types.js";
 const DEFAULT_REFLECTT_URL = "http://localhost:4445";
 
 // ── GitHub mention remapping ───────────────────────────────────────────────
-// Shared GitHub accounts (e.g. itskai-dev) show as @itskaidev in webhook
-// messages. Remap to the correct agent name before routing to sessions.
-const GITHUB_MENTION_REMAP: Record<string, string> = {
-  itskaidev: "kai",
-  "itskai-dev": "kai",
-};
-
-function remapGitHubMentions(text: string): string {
+// Map GitHub usernames → agent names for incoming webhook messages.
+// Configured per-host via channels.reflectt.githubMentionRemap in openclaw.json.
+// No defaults — do not hardcode team-specific accounts here.
+function remapGitHubMentions(text: string, remap: Record<string, string>): string {
   if (!text) return text;
   let result = text;
-  for (const [githubUser, agentName] of Object.entries(GITHUB_MENTION_REMAP)) {
+  for (const [githubUser, agentName] of Object.entries(remap)) {
     result = result.replace(new RegExp(`@${githubUser}\\b`, "gi"), `@${agentName}`);
   }
   return result;
@@ -42,8 +38,17 @@ function releaseSseSlot(controller: AbortController): void {
 }
 // ──────────────────────────────────────────────────────────────────────────
 
-const WATCHED_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
-const WATCHED_SET = new Set<string>(WATCHED_AGENTS);
+/** Fetch the current team roster from the node. Falls back to empty array on error. */
+async function fetchWatchedAgents(url: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${url}/team/roles`);
+    if (!res.ok) return [];
+    const data = await res.json() as { agents?: Array<{ name: string }> };
+    return (data?.agents ?? []).map((a) => a.name).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 
 const IDLE_NUDGE_WINDOW_MS = 15 * 60 * 1000; // 15m
 const WATCHDOG_INTERVAL_MS = 60 * 1000; // 1m poll
@@ -87,9 +92,10 @@ async function fetchRecentMessages(url: string): Promise<Array<Record<string, un
   return [];
 }
 
-async function seedWatchdogState(url: string, state: WatchdogState): Promise<void> {
+async function seedWatchdogState(url: string, state: WatchdogState, watchedAgents: string[]): Promise<void> {
   const now = Date.now();
-  for (const agent of WATCHED_AGENTS) {
+  const watchedSet = new Set(watchedAgents);
+  for (const agent of watchedAgents) {
     state.lastUpdateByAgent.set(agent, now);
   }
 
@@ -99,7 +105,7 @@ async function seedWatchdogState(url: string, state: WatchdogState): Promise<voi
     if (channel !== "general") continue;
 
     const senderId = normalizeSenderId(msg.from);
-    if (!senderId || !WATCHED_SET.has(senderId)) continue;
+    if (!senderId || !watchedSet.has(senderId)) continue;
 
     const rawTs = msg.timestamp;
     const ts =
@@ -236,16 +242,25 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
         lastEscalationAt: new Map(),
       };
 
+      // Fetch current team roster from node — no hardcoded agent names
+      let watchedAgents: string[] = [];
       try {
-        await seedWatchdogState(account.url, watchdogState);
+        watchedAgents = await fetchWatchedAgents(account.url);
+        await seedWatchdogState(account.url, watchdogState, watchedAgents);
       } catch (error) {
         log?.warn?.(`Failed to seed watchdog state: ${error}`);
       }
+      let watchedSet = new Set(watchedAgents);
 
       const watchdogTimer = setInterval(async () => {
         const now = Date.now();
+        // Refresh roster periodically so new agents added via PUT /config/team-roles are picked up
+        if (now % (5 * 60 * 1000) < 60_000) {
+          watchedAgents = await fetchWatchedAgents(account.url).catch(() => watchedAgents);
+          watchedSet = new Set(watchedAgents);
+        }
 
-        for (const agent of WATCHED_AGENTS) {
+        for (const agent of watchedAgents) {
           const lastUpdateAt = watchdogState.lastUpdateByAgent.get(agent) ?? now;
           if (now - lastUpdateAt <= IDLE_NUDGE_WINDOW_MS) continue;
 
@@ -306,7 +321,7 @@ export const reflecttPlugin: ChannelPlugin<ResolvedReflecttAccount> = {
 
                   if ((event.type === "chat_message" || event.type === "message") && message) {
                     const senderId = normalizeSenderId(message.from);
-                    if (senderId && WATCHED_SET.has(senderId) && message.channel === "general") {
+                    if (senderId && watchedSet.has(senderId) && message.channel === "general") {
                       const rawTs = message.timestamp;
                       const ts =
                         typeof rawTs === "number" && Number.isFinite(rawTs)
@@ -362,8 +377,9 @@ async function handleChatMessage(
   try {
     const { from, channel, content, timestamp, id } = message;
     const rawContent = typeof content === "string" ? content : "";
-    // Remap shared GitHub account mentions (e.g. @itskaidev → @kai)
-    const safeContent = remapGitHubMentions(rawContent);
+    // Remap GitHub account mentions using per-host config (channels.reflectt.githubMentionRemap)
+    const mentionRemap = (cfg.channels?.reflectt as ReflecttConfig | undefined)?.githubMentionRemap ?? {};
+    const safeContent = remapGitHubMentions(rawContent, mentionRemap);
     const safeChannel = typeof channel === "string" ? channel : "general";
 
     // Check if message mentions an agent
