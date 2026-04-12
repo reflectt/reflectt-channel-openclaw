@@ -30,14 +30,15 @@ function extractAgentFromSessionKey(key: string): string | null {
   return null;
 }
 
-const FALLBACK_AGENTS = ["kai", "link", "pixel", "echo", "harmony", "rhythm", "sage", "scout", "spark"] as const;
+// No fallback agents — roster is always populated dynamically from /team/roles.
+// Hardcoding names here would leak the developer team's roster into every provisioned team.
 const IDLE_NUDGE_WINDOW_MS = 15 * 60 * 1000; // 15m
 const WATCHDOG_INTERVAL_MS = 60 * 1000; // 1m
 const ESCALATION_COOLDOWN_MS = 20 * 60 * 1000;
 const AGENT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // refresh team roles every 5m
 
-// Dynamic agent roster — populated from /team/roles, falls back to FALLBACK_AGENTS
-const discoveredAgents = new Set<string>(FALLBACK_AGENTS);
+// Dynamic agent roster — populated from /team/roles on connect
+const discoveredAgents = new Set<string>();
 const agentAliases = new Map<string, string>(); // alias → canonical agent name
 let lastAgentRefreshAt = 0;
 let agentRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -267,14 +268,14 @@ async function hasActiveTask(url: string, agent: string, now = Date.now()): Prom
   }
 
   try {
-    const response = await fetch(`${url}/tasks/next?agent=${encodeURIComponent(agent)}`);
+    const response = await fetch(`${url}/tasks?assignee=${encodeURIComponent(agent)}&status=todo&limit=1`);
     if (!response.ok) {
       hasActiveTaskByAgent.set(agent, { value: true, checkedAt: now });
       return true;
     }
 
-    const data = await response.json() as { task?: unknown };
-    const value = Boolean(data?.task);
+    const data = await response.json() as { tasks?: unknown[]; total?: number };
+    const value = (data?.total ?? data?.tasks?.length ?? 0) > 0;
     hasActiveTaskByAgent.set(agent, { value, checkedAt: now });
     return value;
   } catch {
