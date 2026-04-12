@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/reflectt-channel",
+  "name": "reflectt-channel-openclaw",
   "version": "1.0.0",
   "description": "OpenClaw channel plugin for reflectt-node",
   "type": "module",
