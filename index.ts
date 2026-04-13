@@ -346,10 +346,16 @@ function connectSSE(url: string, account: ReflecttAccount, ctx: any) {
       return;
     }
 
-    // Connection succeeded — reset backoff
+    // Connection succeeded — reset backoff and cancel any stale reconnect timer.
+    // A stale timer can fire ~1s after startAccount restarts the channel,
+    // destroying the newly-established connection and causing a reconnect loop.
     currentRetryMs = SSE_INITIAL_RETRY_MS;
     sseConnected = true;
     lastSSEDataAt = Date.now();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     ctx.log?.info("[reflectt] SSE connected ✓");
 
     // Re-seed agent activity after reconnect
