@@ -39,7 +39,8 @@ const AGENT_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // refresh team roles every 5m
 
 // Dynamic agent roster — populated from /team/roles on connect
 const discoveredAgents = new Set<string>();
-const agentAliases = new Map<string, string>(); // alias → canonical agent name
+const agentAliases = new Map<string, string>(); // first agent in TEAM-ROLES.yaml = founding agent letter identity
+let teamLeadAgent: string | null = null;
 let lastAgentRefreshAt = 0;
 let agentRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let usageHookActive = false; // global guard — onDiagnosticEvent is process-wide, subscribe once
@@ -79,6 +80,12 @@ async function refreshAgentRoster(url: string, log?: any): Promise<void> {
 
     // Merge — never remove agents mid-session, only add
     for (const name of newNames) discoveredAgents.add(name);
+
+    // First agent in TEAM-ROLES.yaml is the team lead — the founding "main" agent letter identity
+    const firstName = agents[0]?.name?.toLowerCase().trim() ?? agents[0]?.agent?.toLowerCase().trim();
+    if (firstName && firstName !== "main") {
+      teamLeadAgent = firstName;
+    }
     for (const [alias, canonical] of newAliases) agentAliases.set(alias, canonical);
 
     lastAgentRefreshAt = Date.now();
@@ -572,7 +579,8 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
         if (a.id === mention) { agentId = a.id; break; }
         if (a.identity?.name?.toLowerCase() === mention) { agentId = a.id; break; }
       }
-      if (!agentId && mention === "kai") agentId = "main";
+      // Route @mentions of the team lead to the founding "main" session
+      if (!agentId && teamLeadAgent && mention === teamLeadAgent) agentId = "main";
       // Check discovered agents from /team/roles if not in openclaw config
       if (!agentId && discoveredAgents.has(mention)) agentId = mention;
       // Check aliases
@@ -647,7 +655,7 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       delete safeCtx.sessionFile;
 
       // Create reply dispatcher
-      const agentName = agentId === "main" ? "kai" : agentId;
+      const agentName = agentId === "main" ? (teamLeadAgent ?? agentId) : agentId;
       const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         deliver: async (payload: any) => {
           const text = payload.text || payload.content || "";
@@ -744,7 +752,7 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
       const cfg = pluginRuntime?.config?.loadConfig?.() ?? {};
       const account = resolveAccount(cfg, accountId);
       // Determine agent name for "from" field
-      const agentName = "kai"; // TODO: resolve from session context
+      const agentName = teamLeadAgent ?? "main";
       await postMessage(account.url, agentName, "general", text ?? "");
       return { channel: "reflectt" as const, to, messageId: `rn-${Date.now()}` };
     },
