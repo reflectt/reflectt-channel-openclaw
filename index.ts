@@ -894,6 +894,127 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
   },
 };
 
+// ── Cloud → channel → node identity write bridge ───────────────────────────
+//
+// Per kai's lock 2026-04-22 (write_seam_decision_2026_04_22_2324 on
+// task-1776815665086-ebfbj898x): cloud sends agent-identity edits to this
+// plugin HTTP route on the OpenClaw gateway listener. The handler bridges
+// to reflectt-node `PATCH /agents/:name/identity` so reads and writes stay
+// on one source of truth.
+//
+// The route lives under `/api/channels/...` so the gateway's
+// `isProtectedPluginRoutePath` predicate auto-enforces gateway-token auth
+// (no per-handler auth code needed).
+
+const IDENTITY_ROUTE_PREFIX = "/api/channels/reflectt/agents/";
+const IDENTITY_ROUTE_SUFFIX = "/identity";
+
+function parseAgentNameFromIdentityPath(pathname: string): string | null {
+  if (!pathname.startsWith(IDENTITY_ROUTE_PREFIX)) return null;
+  if (!pathname.endsWith(IDENTITY_ROUTE_SUFFIX)) return null;
+  const middle = pathname.slice(IDENTITY_ROUTE_PREFIX.length, -IDENTITY_ROUTE_SUFFIX.length);
+  if (!middle || middle.includes("/")) return null;
+  try {
+    const decoded = decodeURIComponent(middle);
+    if (!decoded || /[\s/?#]/.test(decoded)) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function readRequestBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const MAX = 256 * 1024; // 256KB cap — identity payloads are tiny
+    req.on("data", (c: Buffer) => {
+      total += c.length;
+      if (total > MAX) {
+        reject(new Error("payload too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+async function handleIdentityWrite(params: {
+  api: OpenClawPluginApi;
+  req: http.IncomingMessage;
+  res: http.ServerResponse;
+  agentName: string;
+}): Promise<void> {
+  const { api, req, res, agentName } = params;
+  const acct = resolveAccount(api.config);
+  const nodeUrl = acct.url;
+
+  let body: string;
+  try {
+    body = await readRequestBody(req);
+  } catch (err) {
+    res.statusCode = 413;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: false, error: String((err as Error).message ?? err) }));
+    return;
+  }
+
+  const headers: Record<string, string> = {
+    "Content-Type": req.headers["content-type"] || "application/json",
+  };
+  const ifMatch = req.headers["if-match"];
+  if (typeof ifMatch === "string" && ifMatch) headers["If-Match"] = ifMatch;
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${nodeUrl}/agents/${encodeURIComponent(agentName)}/identity`, {
+      method: "PATCH",
+      headers,
+      body: body || "{}",
+    });
+  } catch (err) {
+    api.logger.warn(`[reflectt] identity write bridge: node unreachable at ${nodeUrl}: ${String(err)}`);
+    res.statusCode = 502;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({
+      success: false,
+      error: "reflectt-node unreachable",
+      detail: String((err as Error).message ?? err),
+    }));
+    return;
+  }
+
+  const upstreamBody = await upstream.text();
+  res.statusCode = upstream.status;
+  const ct = upstream.headers.get("content-type");
+  if (ct) res.setHeader("Content-Type", ct);
+  res.end(upstreamBody);
+}
+
+function registerIdentityHttpBridge(api: OpenClawPluginApi): void {
+  api.registerHttpHandler(async (req, res) => {
+    if (!req.url) return false;
+    const url = new URL(req.url, "http://localhost");
+    const agentName = parseAgentNameFromIdentityPath(url.pathname);
+    if (!agentName) return false;
+
+    const method = (req.method ?? "GET").toUpperCase();
+    if (method !== "PUT" && method !== "PATCH") {
+      res.statusCode = 405;
+      res.setHeader("Allow", "PUT, PATCH");
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on identity bridge` }));
+      return true;
+    }
+
+    await handleIdentityWrite({ api, req, res, agentName });
+    return true;
+  });
+}
+
 // --- Plugin entry ---
 
 const plugin = {
@@ -905,6 +1026,8 @@ const plugin = {
     pluginRuntime = api.runtime;
     api.logger.info("[reflectt] Registering channel plugin");
     api.registerChannel({ plugin: reflecttPlugin });
+    registerIdentityHttpBridge(api);
+    api.logger.info(`[reflectt] Registered identity write bridge at ${IDENTITY_ROUTE_PREFIX}:agentName${IDENTITY_ROUTE_SUFFIX}`);
   },
 };
 
