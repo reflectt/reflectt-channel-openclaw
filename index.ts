@@ -1255,6 +1255,360 @@ async function dispatchMemoryRequest(
   await handleAgentMemoryRead({ res, agentName });
 }
 
+// ── Cloud → channel agent-config bridge (Phase 2 write seam) ──────────────
+//
+// Per kai's lane lock 2026-04-23 (msg-1776941258132): OpenClaw config IS the
+// truth source for agent optimization surfaces (primary model, fallbacks,
+// thinking level). Defaults live in `agents.defaults.{model, thinkingDefault}`,
+// per-agent overrides live in `agents.list[id].model`. No node SQLite, no env
+// var defaults — read/write the real config through the supported plugin SDK
+// surface (`runtime.config.loadConfig` + `writeConfigFile`).
+//
+// Per-agent thinkingLevel is currently NOT supported by AgentEntrySchema in
+// OpenClaw config (strict zod schema). We expose it as readonly per-agent
+// with an honest hint, rather than inventing a side-channel.
+//
+// Protected by the gateway's `isProtectedPluginRoutePath` predicate so the
+// gateway-token Bearer is enforced upstream of the handler.
+
+const CONFIG_ROUTE_PREFIX = "/api/channels/reflectt/agent-configs/";
+
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+type FieldSource = "override" | "default" | "unset";
+type FieldSupport = "editable" | "readonly";
+
+interface SupportedField<T> {
+  value?: T;
+  effective: T | null;
+  support: FieldSupport;
+  source: FieldSource;
+  hint?: string;
+}
+
+interface ResolvedAgentConfig {
+  agentId: string;
+  revision: string;
+  fields: {
+    model: SupportedField<string>;
+    fallbackModels: SupportedField<string[]>;
+    thinkingLevel: SupportedField<ThinkingLevel>;
+  };
+}
+
+const THINKING_LEVELS = new Set<ThinkingLevel>([
+  "off", "minimal", "low", "medium", "high", "xhigh",
+]);
+
+const PER_AGENT_THINKING_HINT =
+  "thinkingLevel per-agent override is not supported by the OpenClaw AgentEntrySchema; update agents.defaults.thinkingDefault to change the global default";
+
+function parseAgentNameFromConfigPath(pathname: string): string | null {
+  if (!pathname.startsWith(CONFIG_ROUTE_PREFIX)) return null;
+  const tail = pathname.slice(CONFIG_ROUTE_PREFIX.length);
+  if (!tail || tail.includes("/")) return null;
+  try {
+    const decoded = decodeURIComponent(tail);
+    if (!decoded || /[\s/?#]/.test(decoded)) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function modelPrimary(m: unknown): string | undefined {
+  if (typeof m === "string") return m;
+  if (m && typeof m === "object" && "primary" in m) {
+    const p = (m as { primary?: unknown }).primary;
+    return typeof p === "string" ? p : undefined;
+  }
+  return undefined;
+}
+
+function modelFallbacks(m: unknown): string[] | undefined {
+  if (m && typeof m === "object" && !Array.isArray(m) && "fallbacks" in m) {
+    const f = (m as { fallbacks?: unknown }).fallbacks;
+    if (Array.isArray(f) && f.every((s) => typeof s === "string")) return f as string[];
+  }
+  return undefined;
+}
+
+function findEntry(cfg: OpenClawConfig, agentId: string): { model?: unknown } | undefined {
+  const list = (cfg as any)?.agents?.list;
+  if (!Array.isArray(list)) return undefined;
+  return list.find((a: any) => a && a.id === agentId);
+}
+
+function field<T>(params: {
+  override?: T;
+  defaultValue?: T;
+  support: FieldSupport;
+  hint?: string;
+}): SupportedField<T> {
+  const { override, defaultValue, support, hint } = params;
+  let source: FieldSource;
+  if (override !== undefined) source = "override";
+  else if (defaultValue !== undefined) source = "default";
+  else source = "unset";
+  const effective = (override ?? defaultValue ?? null) as T | null;
+  const out: SupportedField<T> = { effective, support, source };
+  if (override !== undefined) out.value = override;
+  if (hint) out.hint = hint;
+  return out;
+}
+
+function configRevision(slice: unknown): string {
+  // sha1 is plenty for revision (collision-resistant enough for optimistic concurrency on a small slice)
+  // Lazy require so we don't pay for crypto unless this code path runs.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { createHash } = require("node:crypto");
+  return createHash("sha1").update(JSON.stringify(slice)).digest("hex").slice(0, 16);
+}
+
+function buildResolvedAgentConfig(cfg: OpenClawConfig, agentId: string): ResolvedAgentConfig {
+  const defaults = (cfg as any)?.agents?.defaults ?? {};
+  const entry = findEntry(cfg, agentId);
+
+  const overrideModel = modelPrimary(entry?.model);
+  const defaultModel = modelPrimary(defaults.model);
+  const overrideFallbacks = modelFallbacks(entry?.model);
+  const defaultFallbacks = modelFallbacks(defaults.model);
+  const defaultThinking =
+    typeof defaults.thinkingDefault === "string" && THINKING_LEVELS.has(defaults.thinkingDefault as ThinkingLevel)
+      ? (defaults.thinkingDefault as ThinkingLevel)
+      : undefined;
+
+  // Slice only the bytes the API actually exposes — revision rotates only on observable changes.
+  const slice = {
+    defaults: {
+      model: defaults.model ?? null,
+      thinkingDefault: defaults.thinkingDefault ?? null,
+    },
+    entry: { model: entry?.model ?? null },
+  };
+
+  return {
+    agentId,
+    revision: configRevision(slice),
+    fields: {
+      model: field<string>({ override: overrideModel, defaultValue: defaultModel, support: "editable" }),
+      fallbackModels: field<string[]>({
+        override: overrideFallbacks,
+        defaultValue: defaultFallbacks,
+        support: "editable",
+      }),
+      thinkingLevel: field<ThinkingLevel>({
+        override: undefined,
+        defaultValue: defaultThinking,
+        support: "readonly",
+        hint: PER_AGENT_THINKING_HINT,
+      }),
+    },
+  };
+}
+
+function jsonResponse(res: http.ServerResponse, status: number, body: unknown): void {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
+}
+
+async function handleConfigGet(api: OpenClawPluginApi, res: http.ServerResponse, agentName: string): Promise<void> {
+  let cfg: OpenClawConfig;
+  try {
+    cfg = api.runtime.config.loadConfig();
+  } catch (err) {
+    api.logger.warn(`[reflectt] config read failed: ${String((err as Error).message ?? err)}`);
+    jsonResponse(res, 500, { success: false, error: "config_read_failed", detail: String((err as Error).message ?? err) });
+    return;
+  }
+  const resolved = buildResolvedAgentConfig(cfg, agentName);
+  jsonResponse(res, 200, { success: true, resolved });
+}
+
+async function handleConfigPatch(
+  api: OpenClawPluginApi,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  agentName: string,
+): Promise<void> {
+  let body: string;
+  try {
+    body = await readRequestBody(req);
+  } catch (err) {
+    jsonResponse(res, 413, { success: false, error: String((err as Error).message ?? err) });
+    return;
+  }
+
+  let parsed: { ifMatch?: unknown; updates?: unknown };
+  try {
+    parsed = body ? JSON.parse(body) : {};
+  } catch {
+    jsonResponse(res, 400, { success: false, error: "invalid_json" });
+    return;
+  }
+
+  const ifMatch = parsed.ifMatch;
+  if (typeof ifMatch !== "string" || !ifMatch) {
+    jsonResponse(res, 400, { success: false, error: "ifMatch_required" });
+    return;
+  }
+  const updates = (parsed.updates ?? {}) as Record<string, unknown>;
+  if (typeof updates !== "object" || updates === null || Array.isArray(updates)) {
+    jsonResponse(res, 400, { success: false, error: "updates_must_be_object" });
+    return;
+  }
+
+  let cfg: OpenClawConfig;
+  try {
+    cfg = api.runtime.config.loadConfig();
+  } catch (err) {
+    jsonResponse(res, 500, { success: false, error: "config_read_failed", detail: String((err as Error).message ?? err) });
+    return;
+  }
+
+  const current = buildResolvedAgentConfig(cfg, agentName);
+  if (current.revision !== ifMatch) {
+    jsonResponse(res, 412, { success: false, error: "precondition_failed", current });
+    return;
+  }
+
+  if ("thinkingLevel" in updates) {
+    jsonResponse(res, 422, {
+      success: false,
+      error: "unsupported_field",
+      field: "thinkingLevel",
+      hint: PER_AGENT_THINKING_HINT,
+    });
+    return;
+  }
+
+  // Validate proposed update shapes before mutating
+  if ("model" in updates) {
+    const v = updates.model;
+    if (v !== null && v !== undefined && typeof v !== "string") {
+      jsonResponse(res, 400, { success: false, error: "model_must_be_string_or_null" });
+      return;
+    }
+  }
+  if ("fallbackModels" in updates) {
+    const v = updates.fallbackModels;
+    if (v !== null && v !== undefined) {
+      if (!Array.isArray(v) || !v.every((s) => typeof s === "string")) {
+        jsonResponse(res, 400, { success: false, error: "fallbackModels_must_be_string_array_or_null" });
+        return;
+      }
+    }
+  }
+
+  // Deep-clone via JSON round-trip so we don't mutate the cached config object
+  const next = JSON.parse(JSON.stringify(cfg)) as OpenClawConfig;
+  const nextAny = next as any;
+  if (!nextAny.agents) nextAny.agents = {};
+  if (!Array.isArray(nextAny.agents.list)) nextAny.agents.list = [];
+  let entry = nextAny.agents.list.find((a: any) => a && a.id === agentName);
+  if (!entry) {
+    entry = { id: agentName };
+    nextAny.agents.list.push(entry);
+  }
+
+  // Normalize current per-agent model into object form for in-place edits
+  let nextModel: { primary?: string; fallbacks?: string[] } | undefined;
+  if (typeof entry.model === "string") nextModel = { primary: entry.model };
+  else if (entry.model && typeof entry.model === "object") nextModel = { ...entry.model };
+  else nextModel = undefined;
+
+  if ("model" in updates) {
+    const v = updates.model;
+    if (v === null || v === undefined) {
+      if (nextModel) delete nextModel.primary;
+    } else {
+      nextModel = { ...(nextModel ?? {}), primary: v as string };
+    }
+  }
+  if ("fallbackModels" in updates) {
+    const v = updates.fallbackModels;
+    if (v === null || v === undefined) {
+      if (nextModel) delete nextModel.fallbacks;
+    } else {
+      nextModel = { ...(nextModel ?? {}), fallbacks: v as string[] };
+    }
+  }
+
+  const hasPrimary = nextModel?.primary !== undefined;
+  const hasFallbacks = !!nextModel?.fallbacks && nextModel.fallbacks.length > 0;
+  if (nextModel && (hasPrimary || hasFallbacks)) {
+    entry.model = nextModel;
+  } else {
+    delete entry.model;
+  }
+
+  try {
+    await api.runtime.config.writeConfigFile(next);
+  } catch (err) {
+    api.logger.warn(`[reflectt] config write failed for ${agentName}: ${String((err as Error).message ?? err)}`);
+    jsonResponse(res, 500, {
+      success: false,
+      error: "config_write_failed",
+      detail: String((err as Error).message ?? err),
+    });
+    return;
+  }
+
+  // writeConfigFile clears the config cache, so loadConfig returns fresh state
+  let updatedCfg: OpenClawConfig;
+  try {
+    updatedCfg = api.runtime.config.loadConfig();
+  } catch (err) {
+    jsonResponse(res, 500, { success: false, error: "config_reread_failed", detail: String((err as Error).message ?? err) });
+    return;
+  }
+  const updated = buildResolvedAgentConfig(updatedCfg, agentName);
+  jsonResponse(res, 200, { success: true, resolved: updated });
+}
+
+async function dispatchConfigRequest(
+  api: OpenClawPluginApi,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  agentName: string,
+): Promise<void> {
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method === "GET") {
+    await handleConfigGet(api, res, agentName);
+    return;
+  }
+  if (method === "PATCH") {
+    await handleConfigPatch(api, req, res, agentName);
+    return;
+  }
+  res.statusCode = 405;
+  res.setHeader("Allow", "GET, PATCH");
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on agent-config bridge` }));
+}
+
+function registerAgentConfigHttpBridge(api: OpenClawPluginApi): void {
+  api.registerHttpRoute({
+    path: CONFIG_ROUTE_PREFIX,
+    auth: "gateway",
+    match: "prefix",
+    replaceExisting: true,
+    handler: async (req, res) => {
+      if (!req.url) {
+        jsonResponse(res, 400, { success: false, error: "missing request url" });
+        return;
+      }
+      const url = new URL(req.url, "http://localhost");
+      const agentName = parseAgentNameFromConfigPath(url.pathname);
+      if (!agentName) {
+        jsonResponse(res, 404, { success: false, error: "not found" });
+        return;
+      }
+      await dispatchConfigRequest(api, req, res, agentName);
+    },
+  });
+}
+
 // Single registration covering all three agent-detail bridges (identity write,
 // files read, memory index read) under the shared `/api/channels/reflectt/agents/`
 // prefix. Migrated from the removed `api.registerHttpHandler(...)` chain pattern
@@ -1314,6 +1668,8 @@ const plugin = {
     api.registerChannel({ plugin: reflecttPlugin });
     registerAgentDetailHttpBridges(api);
     api.logger.info(`[reflectt] Registered agent-detail bridges at ${IDENTITY_ROUTE_PREFIX} (suffixes: ${IDENTITY_ROUTE_SUFFIX}, ${FILES_ROUTE_SUFFIX}, ${MEMORY_ROUTE_SUFFIX})`);
+    registerAgentConfigHttpBridge(api);
+    api.logger.info(`[reflectt] Registered agent-config bridge at ${CONFIG_ROUTE_PREFIX}`);
   },
 };
 
