@@ -8,6 +8,10 @@ export type ReflecttConfig = {
   /** Optional GitHub username → agent name remapping (e.g. { "myorg-bot": "lead" }).
    *  No defaults — configure per-host as needed. */
   githubMentionRemap?: Record<string, string>;
+  /** Agent id or name that receives messages with no @-mention. Without this,
+   *  unaddressed messages would silently drop on the floor. Falls back to the
+   *  first agent in cfg.agents.list when unset. */
+  defaultAgent?: string;
 };
 
 export type ResolvedReflecttAccount = {
