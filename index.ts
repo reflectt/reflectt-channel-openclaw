@@ -995,23 +995,40 @@ async function handleIdentityWrite(params: {
 }
 
 function registerIdentityHttpBridge(api: OpenClawPluginApi): void {
-  api.registerHttpHandler(async (req, res) => {
-    if (!req.url) return false;
-    const url = new URL(req.url, "http://localhost");
-    const agentName = parseAgentNameFromIdentityPath(url.pathname);
-    if (!agentName) return false;
+  // We register a prefix on the protected /api/channels namespace so the gateway
+  // auto-enforces gateway-token auth, then narrow to /agents/:name/identity inside
+  // the handler. Returning false lets unrelated paths fall through to other routes.
+  (api as unknown as {
+    registerHttpRoute: (params: {
+      path: string;
+      match?: "exact" | "prefix";
+      auth: "plugin" | "gateway";
+      replaceExisting?: boolean;
+      handler: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean | void> | boolean | void;
+    }) => void;
+  }).registerHttpRoute({
+    path: IDENTITY_ROUTE_PREFIX.replace(/\/$/, ""),
+    match: "prefix",
+    auth: "plugin",
+    replaceExisting: true,
+    handler: async (req, res) => {
+      if (!req.url) return false;
+      const url = new URL(req.url, "http://localhost");
+      const agentName = parseAgentNameFromIdentityPath(url.pathname);
+      if (!agentName) return false;
 
-    const method = (req.method ?? "GET").toUpperCase();
-    if (method !== "PUT" && method !== "PATCH") {
-      res.statusCode = 405;
-      res.setHeader("Allow", "PUT, PATCH");
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on identity bridge` }));
+      const method = (req.method ?? "GET").toUpperCase();
+      if (method !== "PUT" && method !== "PATCH") {
+        res.statusCode = 405;
+        res.setHeader("Allow", "PUT, PATCH");
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on identity bridge` }));
+        return true;
+      }
+
+      await handleIdentityWrite({ api, req, res, agentName });
       return true;
-    }
-
-    await handleIdentityWrite({ api, req, res, agentName });
-    return true;
+    },
   });
 }
 
