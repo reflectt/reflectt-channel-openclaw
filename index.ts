@@ -994,25 +994,21 @@ async function handleIdentityWrite(params: {
   res.end(upstreamBody);
 }
 
-function registerIdentityHttpBridge(api: OpenClawPluginApi): void {
-  api.registerHttpHandler(async (req, res) => {
-    if (!req.url) return false;
-    const url = new URL(req.url, "http://localhost");
-    const agentName = parseAgentNameFromIdentityPath(url.pathname);
-    if (!agentName) return false;
-
-    const method = (req.method ?? "GET").toUpperCase();
-    if (method !== "PUT" && method !== "PATCH") {
-      res.statusCode = 405;
-      res.setHeader("Allow", "PUT, PATCH");
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on identity bridge` }));
-      return true;
-    }
-
-    await handleIdentityWrite({ api, req, res, agentName });
-    return true;
-  });
+async function dispatchIdentityRequest(
+  api: OpenClawPluginApi,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  agentName: string,
+): Promise<void> {
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "PUT" && method !== "PATCH") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "PUT, PATCH");
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on identity bridge` }));
+    return;
+  }
+  await handleIdentityWrite({ api, req, res, agentName });
 }
 
 // ── Cloud → channel agent-detail read bridges (Phase 1) ───────────────────
@@ -1227,40 +1223,81 @@ async function handleAgentMemoryRead(params: {
   }));
 }
 
-function registerAgentReadHttpBridges(api: OpenClawPluginApi): void {
-  api.registerHttpHandler(async (req, res) => {
-    if (!req.url) return false;
-    const url = new URL(req.url, "http://localhost");
+async function dispatchFilesRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  agentName: string,
+): Promise<void> {
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET");
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on files read bridge` }));
+    return;
+  }
+  await handleAgentFilesRead({ res, agentName });
+}
 
-    const filesAgent = parseAgentNameFromSuffixedPath(url.pathname, FILES_ROUTE_SUFFIX);
-    if (filesAgent) {
-      const method = (req.method ?? "GET").toUpperCase();
-      if (method !== "GET") {
-        res.statusCode = 405;
-        res.setHeader("Allow", "GET");
+async function dispatchMemoryRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  agentName: string,
+): Promise<void> {
+  const method = (req.method ?? "GET").toUpperCase();
+  if (method !== "GET") {
+    res.statusCode = 405;
+    res.setHeader("Allow", "GET");
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on memory read bridge` }));
+    return;
+  }
+  await handleAgentMemoryRead({ res, agentName });
+}
+
+// Single registration covering all three agent-detail bridges (identity write,
+// files read, memory index read) under the shared `/api/channels/reflectt/agents/`
+// prefix. Migrated from the removed `api.registerHttpHandler(...)` chain pattern
+// to `api.registerHttpRoute({ match: "prefix" })` per OpenClaw 2026.4.x SDK.
+// Auth `gateway` so the OpenClaw gateway-token Bearer is enforced upstream of
+// the handler.
+function registerAgentDetailHttpBridges(api: OpenClawPluginApi): void {
+  api.registerHttpRoute({
+    path: IDENTITY_ROUTE_PREFIX,
+    auth: "gateway",
+    match: "prefix",
+    replaceExisting: true,
+    handler: async (req, res) => {
+      if (!req.url) {
+        res.statusCode = 400;
         res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on files read bridge` }));
-        return true;
+        res.end(JSON.stringify({ success: false, error: "missing request url" }));
+        return;
       }
-      await handleAgentFilesRead({ res, agentName: filesAgent });
-      return true;
-    }
+      const url = new URL(req.url, "http://localhost");
 
-    const memoryAgent = parseAgentNameFromSuffixedPath(url.pathname, MEMORY_ROUTE_SUFFIX);
-    if (memoryAgent) {
-      const method = (req.method ?? "GET").toUpperCase();
-      if (method !== "GET") {
-        res.statusCode = 405;
-        res.setHeader("Allow", "GET");
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on memory read bridge` }));
-        return true;
+      const identityAgent = parseAgentNameFromIdentityPath(url.pathname);
+      if (identityAgent) {
+        await dispatchIdentityRequest(api, req, res, identityAgent);
+        return;
       }
-      await handleAgentMemoryRead({ res, agentName: memoryAgent });
-      return true;
-    }
 
-    return false;
+      const filesAgent = parseAgentNameFromSuffixedPath(url.pathname, FILES_ROUTE_SUFFIX);
+      if (filesAgent) {
+        await dispatchFilesRequest(req, res, filesAgent);
+        return;
+      }
+
+      const memoryAgent = parseAgentNameFromSuffixedPath(url.pathname, MEMORY_ROUTE_SUFFIX);
+      if (memoryAgent) {
+        await dispatchMemoryRequest(req, res, memoryAgent);
+        return;
+      }
+
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ success: false, error: "not found" }));
+    },
   });
 }
 
@@ -1275,10 +1312,8 @@ const plugin = {
     pluginRuntime = api.runtime;
     api.logger.info("[reflectt] Registering channel plugin");
     api.registerChannel({ plugin: reflecttPlugin });
-    registerIdentityHttpBridge(api);
-    api.logger.info(`[reflectt] Registered identity write bridge at ${IDENTITY_ROUTE_PREFIX}:agentName${IDENTITY_ROUTE_SUFFIX}`);
-    registerAgentReadHttpBridges(api);
-    api.logger.info(`[reflectt] Registered agent-detail read bridges at ${IDENTITY_ROUTE_PREFIX}:agentName{${FILES_ROUTE_SUFFIX},${MEMORY_ROUTE_SUFFIX}}`);
+    registerAgentDetailHttpBridges(api);
+    api.logger.info(`[reflectt] Registered agent-detail bridges at ${IDENTITY_ROUTE_PREFIX} (suffixes: ${IDENTITY_ROUTE_SUFFIX}, ${FILES_ROUTE_SUFFIX}, ${MEMORY_ROUTE_SUFFIX})`);
   },
 };
 
