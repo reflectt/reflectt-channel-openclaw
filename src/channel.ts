@@ -383,14 +383,24 @@ async function handleChatMessage(
     const safeChannel = typeof channel === "string" ? channel : "general";
 
     // Check if message mentions an agent
-    const mentionedAgents = extractAgentMentions(safeContent, cfg);
-    
+    const explicitMentions = extractAgentMentions(safeContent, cfg);
+    let mentionedAgents = explicitMentions;
+    let routedToDefault = false;
+
     if (mentionedAgents.length === 0) {
-      // No mentions, ignore
-      return;
+      // No mention → fall back to the configured default agent. Without this
+      // the message drops on the floor, which is the bug agents hit when they
+      // post status/updates without @-tagging anyone.
+      const defaultAgent = resolveDefaultAgent(cfg);
+      if (!defaultAgent) {
+        log?.warn?.(`[reflectt-channel] dropping unaddressed message from ${from} in ${safeChannel} — no defaultAgent configured and no agents in cfg.agents.list`);
+        return;
+      }
+      mentionedAgents = [defaultAgent];
+      routedToDefault = true;
     }
 
-    log?.info?.(`Processing reflectt message from ${from} in ${safeChannel} (mentions: ${mentionedAgents.join(", ")})`);
+    log?.info?.(`Processing reflectt message from ${from} in ${safeChannel} (${routedToDefault ? `default→${mentionedAgents[0]}` : `mentions: ${mentionedAgents.join(", ")}`})`);
 
     // Route to each mentioned agent
     for (const agentId of mentionedAgents) {
@@ -430,7 +440,7 @@ async function handleChatMessage(
           Surface: "reflectt",
           MessageSid: id || String(timestamp || Date.now()),
           Timestamp: timestamp || Date.now(),
-          WasMentioned: true,
+          WasMentioned: !routedToDefault,
           CommandAuthorized: true,
           OriginatingChannel: "reflectt",
           OriginatingTo: safeChannel,
@@ -474,6 +484,27 @@ async function handleChatMessage(
   } catch (error) {
     log?.error?.(`Error handling chat message: ${error}`);
   }
+}
+
+/** Resolve the default agent id used when an inbound message has no @-mention.
+ *  Prefers `cfg.channels.reflectt.defaultAgent` (matched by id or name).
+ *  Falls back to the first agent in `cfg.agents.list` so a fresh host with
+ *  one agent still routes correctly without per-host config. */
+function resolveDefaultAgent(cfg: OpenClawConfig): string | null {
+  const agents = cfg.agents?.list ?? [];
+  if (agents.length === 0) return null;
+
+  const configured = (cfg.channels?.reflectt as ReflecttConfig | undefined)?.defaultAgent;
+  if (configured) {
+    const wanted = configured.toLowerCase();
+    for (const agent of agents) {
+      if (agent.id === configured || agent.name?.toLowerCase() === wanted) {
+        return agent.id;
+      }
+    }
+  }
+
+  return agents[0]?.id ?? null;
 }
 
 function extractAgentMentions(content: string, cfg: OpenClawConfig): string[] {
