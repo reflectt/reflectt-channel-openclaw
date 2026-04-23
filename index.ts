@@ -1015,6 +1015,255 @@ function registerIdentityHttpBridge(api: OpenClawPluginApi): void {
   });
 }
 
+// ── Cloud → channel agent-detail read bridges (Phase 1) ───────────────────
+//
+// Per kai's lane lock 2026-04-23 (msg-1776931994885): node stays runtime-only,
+// workspace files belong to OpenClaw. These two routes surface the workspace
+// files needed by the agent-detail panel — `SOUL.md`, `HEARTBEAT.md`, `USER.md`
+// for the editable/displayable file fields, and a metadata-only memory index
+// for the memory axis.
+//
+// Both routes live under `/api/channels/...` so the gateway's
+// `isProtectedPluginRoutePath` predicate auto-enforces gateway-token Bearer
+// auth (no per-handler auth needed).
+
+const FILES_ROUTE_SUFFIX = "/files";
+const MEMORY_ROUTE_SUFFIX = "/memory";
+const READ_FILE_MAX_BYTES = 400 * 1024; // 400KB per file — well above realistic SOUL/HEARTBEAT/USER sizes
+const MEMORY_INDEX_MAX_ENTRIES = 500; // generous; pane lazy-loads
+
+/** Names of files we expose under `/files`. Any new file requires an explicit allowlist update. */
+const ALLOWED_FILE_NAMES = ["SOUL.md", "HEARTBEAT.md", "USER.md"] as const;
+type AllowedFileName = (typeof ALLOWED_FILE_NAMES)[number];
+
+function parseAgentNameFromSuffixedPath(pathname: string, suffix: string): string | null {
+  if (!pathname.startsWith(IDENTITY_ROUTE_PREFIX)) return null;
+  if (!pathname.endsWith(suffix)) return null;
+  const middle = pathname.slice(IDENTITY_ROUTE_PREFIX.length, -suffix.length);
+  if (!middle || middle.includes("/")) return null;
+  try {
+    const decoded = decodeURIComponent(middle);
+    if (!decoded || /[\s/?#]/.test(decoded)) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function agentWorkspaceRoot(agentName: string): string {
+  return path.join(os.homedir(), ".openclaw", "agents", agentName);
+}
+
+/** Resolve a path, then verify the realpath is contained inside `root`. Returns null if outside. */
+function resolveContained(root: string, candidate: string): string | null {
+  try {
+    const realRoot = fs.realpathSync(root);
+    const resolved = path.resolve(realRoot, candidate);
+    let realResolved: string;
+    try {
+      realResolved = fs.realpathSync(resolved);
+    } catch {
+      // File may not exist yet — fall back to the lexical resolution as the boundary check.
+      realResolved = resolved;
+    }
+    const rel = path.relative(realRoot, realResolved);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    return realResolved;
+  } catch {
+    return null;
+  }
+}
+
+interface FileFieldValue {
+  found: boolean;
+  bytes: number;
+  truncated: boolean;
+  content: string | null;
+  modifiedAt: number | null;
+  hint?: string;
+}
+
+function readAllowedFile(root: string, name: AllowedFileName): FileFieldValue {
+  const resolved = resolveContained(root, name);
+  if (!resolved) return { found: false, bytes: 0, truncated: false, content: null, modifiedAt: null, hint: "path resolution failed" };
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return { found: false, bytes: 0, truncated: false, content: null, modifiedAt: null };
+    return { found: false, bytes: 0, truncated: false, content: null, modifiedAt: null, hint: String(err?.code ?? err) };
+  }
+  if (!stat.isFile()) return { found: false, bytes: 0, truncated: false, content: null, modifiedAt: null, hint: "not a regular file" };
+  const truncated = stat.size > READ_FILE_MAX_BYTES;
+  let content: string | null = null;
+  try {
+    if (truncated) {
+      const fd = fs.openSync(resolved, "r");
+      try {
+        const buf = Buffer.alloc(READ_FILE_MAX_BYTES);
+        const n = fs.readSync(fd, buf, 0, READ_FILE_MAX_BYTES, 0);
+        content = buf.subarray(0, n).toString("utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      content = fs.readFileSync(resolved, "utf8");
+    }
+  } catch (err: any) {
+    return { found: true, bytes: stat.size, truncated, content: null, modifiedAt: stat.mtimeMs, hint: String(err?.code ?? err) };
+  }
+  return { found: true, bytes: stat.size, truncated, content, modifiedAt: stat.mtimeMs };
+}
+
+async function handleAgentFilesRead(params: {
+  res: http.ServerResponse;
+  agentName: string;
+}): Promise<void> {
+  const { res, agentName } = params;
+  const root = agentWorkspaceRoot(agentName);
+  let workspaceExists = true;
+  try {
+    fs.statSync(root);
+  } catch (err: any) {
+    if (err?.code === "ENOENT") workspaceExists = false;
+  }
+
+  const fields: Record<AllowedFileName, FileFieldValue> = {
+    "SOUL.md": readAllowedFile(root, "SOUL.md"),
+    "HEARTBEAT.md": readAllowedFile(root, "HEARTBEAT.md"),
+    "USER.md": readAllowedFile(root, "USER.md"),
+  };
+
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({
+    success: true,
+    agent: agentName,
+    workspaceExists,
+    source: "openclaw",
+    maxBytes: READ_FILE_MAX_BYTES,
+    fields,
+  }));
+}
+
+interface MemoryEntry {
+  name: string;
+  bytes: number;
+  modifiedAt: number;
+}
+
+async function handleAgentMemoryRead(params: {
+  res: http.ServerResponse;
+  agentName: string;
+}): Promise<void> {
+  const { res, agentName } = params;
+  const root = agentWorkspaceRoot(agentName);
+  const memDir = path.join(root, "memory");
+  const resolved = resolveContained(root, "memory");
+  if (!resolved) {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: true, agent: agentName, source: "openclaw", entries: [], hint: "memory dir path resolution failed" }));
+    return;
+  }
+  let dirExists = true;
+  try {
+    const st = fs.statSync(resolved);
+    if (!st.isDirectory()) dirExists = false;
+  } catch (err: any) {
+    if (err?.code === "ENOENT") dirExists = false;
+    else {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ success: true, agent: agentName, source: "openclaw", entries: [], hint: String(err?.code ?? err) }));
+      return;
+    }
+  }
+  if (!dirExists) {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: true, agent: agentName, source: "openclaw", memoryDir: memDir, entries: [] }));
+    return;
+  }
+
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(resolved);
+  } catch (err: any) {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ success: true, agent: agentName, source: "openclaw", entries: [], hint: String(err?.code ?? err) }));
+    return;
+  }
+
+  const entries: MemoryEntry[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".md")) continue;
+    if (name.startsWith(".")) continue;
+    const full = resolveContained(resolved, name);
+    if (!full) continue;
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(full);
+    } catch {
+      continue;
+    }
+    if (!st.isFile()) continue;
+    entries.push({ name, bytes: st.size, modifiedAt: st.mtimeMs });
+  }
+  entries.sort((a, b) => b.modifiedAt - a.modifiedAt);
+  const trimmed = entries.slice(0, MEMORY_INDEX_MAX_ENTRIES);
+
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({
+    success: true,
+    agent: agentName,
+    source: "openclaw",
+    memoryDir: memDir,
+    entries: trimmed,
+    truncated: entries.length > trimmed.length,
+    totalCount: entries.length,
+  }));
+}
+
+function registerAgentReadHttpBridges(api: OpenClawPluginApi): void {
+  api.registerHttpHandler(async (req, res) => {
+    if (!req.url) return false;
+    const url = new URL(req.url, "http://localhost");
+
+    const filesAgent = parseAgentNameFromSuffixedPath(url.pathname, FILES_ROUTE_SUFFIX);
+    if (filesAgent) {
+      const method = (req.method ?? "GET").toUpperCase();
+      if (method !== "GET") {
+        res.statusCode = 405;
+        res.setHeader("Allow", "GET");
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on files read bridge` }));
+        return true;
+      }
+      await handleAgentFilesRead({ res, agentName: filesAgent });
+      return true;
+    }
+
+    const memoryAgent = parseAgentNameFromSuffixedPath(url.pathname, MEMORY_ROUTE_SUFFIX);
+    if (memoryAgent) {
+      const method = (req.method ?? "GET").toUpperCase();
+      if (method !== "GET") {
+        res.statusCode = 405;
+        res.setHeader("Allow", "GET");
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ success: false, error: `method ${method} not allowed on memory read bridge` }));
+        return true;
+      }
+      await handleAgentMemoryRead({ res, agentName: memoryAgent });
+      return true;
+    }
+
+    return false;
+  });
+}
+
 // --- Plugin entry ---
 
 const plugin = {
@@ -1028,6 +1277,8 @@ const plugin = {
     api.registerChannel({ plugin: reflecttPlugin });
     registerIdentityHttpBridge(api);
     api.logger.info(`[reflectt] Registered identity write bridge at ${IDENTITY_ROUTE_PREFIX}:agentName${IDENTITY_ROUTE_SUFFIX}`);
+    registerAgentReadHttpBridges(api);
+    api.logger.info(`[reflectt] Registered agent-detail read bridges at ${IDENTITY_ROUTE_PREFIX}:agentName{${FILES_ROUTE_SUFFIX},${MEMORY_ROUTE_SUFFIX}}`);
   },
 };
 
