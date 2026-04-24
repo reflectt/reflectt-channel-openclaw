@@ -16,6 +16,7 @@ function httpModule(url: string): typeof http | typeof https {
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { publishModelsCatalog } from "./src/publish-models-catalog.js";
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
@@ -727,7 +728,11 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
     chatTypes: ["group"],
     media: false,
   },
-  reload: { configPrefixes: ["channels.reflectt"] },
+  // configPrefixes drive gateway.startAccount re-invocation:
+  //  - "channels.reflectt": channel config edits restart SSE/watchdog
+  //  - "models" / "providers" / "auth": model-truth changes (provider auth,
+  //    registry, defaults) re-publish the bounded ModelsEnvelope to the node
+  reload: { configPrefixes: ["channels.reflectt", "models", "providers", "auth"] },
 
   config: {
     listAccountIds: () => {
@@ -791,6 +796,19 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
       for (const acct of allAccounts) {
         connectSSE(acct.url, acct, ctx);
       }
+
+      // ── Models capability publish-up ─────────────────────────────────────────
+      // Build the bounded ModelsEnvelope from in-process OpenClaw truth and
+      // POST to each account's /openclaw/models/publish. Re-fires on every
+      // startAccount, including reload.configPrefixes triggers (models,
+      // providers, auth). Adapter failure publishes a degraded ok:false
+      // envelope — never silent, never subprocess fallback.
+      for (const acct of allAccounts) {
+        publishModelsCatalog({ url: acct.url, log: ctx.log }).catch((err) => {
+          ctx.log?.warn?.(`[reflectt][models] publish threw for ${acct.accountId}: ${err}`);
+        });
+      }
+      // ───────────────────────────────────────────────────────────────────────
 
       // ── Usage reporting: forward model.usage diagnostic events to reflectt-node ──
       // onDiagnosticEvent is global (not per-account), so only subscribe once.
