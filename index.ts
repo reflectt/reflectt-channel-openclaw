@@ -115,6 +115,8 @@ const SSE_INITIAL_RETRY_MS = 1000;      // start at 1s
 const SSE_MAX_RETRY_MS = 30_000;        // cap at 30s
 const SSE_SOCKET_TIMEOUT_MS = 30_000;   // detect dead TCP after 30s silence
 const SSE_HEALTH_INTERVAL_MS = 15_000;  // health-check ping every 15s
+const HEALTH_PROBE_TIMEOUT_MS = 10_000; // per-probe timeout
+const HEALTH_FAIL_THRESHOLD = 3;        // consecutive failures before tearing down SSE
 
 const lastUpdateByAgent = new Map<string, number>();
 const lastEscalationAt = new Map<string, number>();
@@ -449,33 +451,68 @@ function scheduleReconnect(url: string, account: ReflecttAccount, ctx: any) {
 }
 
 /**
+ * One /health probe using node:http directly (avoids undici keep-alive
+ * pool stalls that observably make `fetch()` time out from inside this
+ * plugin even when shell `curl` to the same URL returns in <5ms).
+ */
+function probeHealth(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let parsed: URL;
+    try { parsed = new URL(`${url}/health`); }
+    catch { resolve(false); return; }
+
+    const req = httpModule(url).request({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : undefined),
+      path: parsed.pathname + (parsed.search || ""),
+      method: "GET",
+      timeout: HEALTH_PROBE_TIMEOUT_MS,
+    }, (res) => {
+      const ok = (res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 500;
+      res.resume();
+      res.on("end", () => resolve(ok));
+      res.on("error", () => resolve(false));
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+/**
  * Periodic health-check: ping /health to detect server availability
  * even when the SSE socket hasn't timed out yet. If the server is up
  * but we're not connected, force a reconnect.
+ *
+ * Only tear down a "connected" SSE after HEALTH_FAIL_THRESHOLD consecutive
+ * failures — single transient hiccups must not destroy a working stream.
  */
 function startHealthCheck(url: string, account: ReflecttAccount, ctx: any) {
   if (healthCheckTimer) return;
 
+  let consecutiveFails = 0;
+
   healthCheckTimer = setInterval(async () => {
     if (stopped) return;
 
-    try {
-      const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
-      if (res.ok) {
-        // Server is alive
-        if (!sseConnected && !reconnectTimer) {
-          ctx.log?.warn("[reflectt] Health OK but SSE not connected — forcing reconnect");
-          currentRetryMs = SSE_INITIAL_RETRY_MS; // reset backoff since server is up
-          connectSSE(url, account, ctx);
-        }
+    const ok = await probeHealth(url);
+    if (ok) {
+      consecutiveFails = 0;
+      if (!sseConnected && !reconnectTimer) {
+        ctx.log?.warn("[reflectt] Health OK but SSE not connected — forcing reconnect");
+        currentRetryMs = SSE_INITIAL_RETRY_MS;
+        connectSSE(url, account, ctx);
       }
-    } catch {
-      // Server unreachable — SSE reconnect loop will handle it
-      if (sseConnected) {
-        ctx.log?.warn("[reflectt] Health check failed while SSE appears connected — destroying stale connection");
-        destroySSE(ctx, "health check failed");
-        scheduleReconnect(url, account, ctx);
-      }
+      return;
+    }
+
+    consecutiveFails++;
+    ctx.log?.warn?.(`[reflectt] Health probe failed (${consecutiveFails}/${HEALTH_FAIL_THRESHOLD})`);
+    if (consecutiveFails >= HEALTH_FAIL_THRESHOLD && sseConnected) {
+      ctx.log?.warn(`[reflectt] ${consecutiveFails} consecutive health failures — destroying SSE connection`);
+      destroySSE(ctx, "health check failed");
+      scheduleReconnect(url, account, ctx);
+      consecutiveFails = 0;
     }
   }, SSE_HEALTH_INTERVAL_MS);
 }
