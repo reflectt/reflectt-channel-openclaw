@@ -1,21 +1,36 @@
 /**
  * openclaw-models-adapter.ts
  *
- * Single isolated bridge to OpenClaw internals for the models capability
- * publish-up seam. Built per #general msg-1777008934839 (kai's call):
+ * Single isolated bridge to OpenClaw internals for the models-capability
+ * publish-up seam. Runs in-process inside the gateway plugin (no subprocess,
+ * no extra transport — kai's lock, msg-1777008934839).
  *
- *   - In-process imports only — no child_process, no extra transport
- *   - One small adapter module (this file) so all internal coupling is here
- *   - Runtime assertion on the imported surface — fail loud on drift
- *   - On import-surface failure, return AdapterError so the publisher can
- *     post a degraded `ok:false` envelope. Never silent, never subprocess
- *     fallback, never crash.
+ * Resolution strategy (managed-host reality, learned 2026-04-24):
+ *   - The managed-host openclaw is bundled (e.g. `/app/openclaw.mjs` +
+ *     `/app/dist/...`); there is NO npm-style `node_modules/openclaw/dist/`
+ *     to resolve from a plugin's perspective.
+ *   - So locate the dist directory by walking up from `process.argv[1]`
+ *     (the gateway entry mjs) and dynamic-import the runtime module via
+ *     a file:// URL. Falls back to OPENCLAW_DIST_ROOT env, then to a
+ *     classic `openclaw/dist/...` resolve (for non-bundled hosts).
  *
- * Shape returned matches the bounded envelope schema enforced by
- * reflectt-node `POST /openclaw/models/publish` — only normalized fields
- * the panel actually needs. NO raw `status`/`configured` blobs.
+ * Auth/availability:
+ *   - The per-agent auth-profiles store doesn't exist on this host (and
+ *     the Pi SDK's discoverAuthStorage requires plumbing we don't want
+ *     here). Instead, we read `~/.openclaw/openclaw.json` directly and
+ *     mark a provider `authenticated` iff it has a non-empty apiKey.
+ *
+ * Failure semantics:
+ *   - Any drift (missing dist, missing export, malformed config) throws
+ *     AdapterError; the publisher converts it to a degraded ok:false
+ *     envelope. Never silent, never subprocess fallback, never crash.
  */
 import { createRequire } from "node:module";
+import { promises as fsp } from "node:fs";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import { pathToFileURL } from "node:url";
 import type {
   ModelsCatalog,
   ModelEntry,
@@ -41,67 +56,116 @@ interface RawModel {
   input?: string[];
 }
 
-interface RawAuthProfile {
-  provider?: string;
-  type?: string;
+interface RawProviderConfig {
+  apiKey?: string;
+  baseUrl?: string;
+  api?: string;
+  models?: unknown[];
 }
 
-interface RawAuthStore {
-  profiles?: Record<string, RawAuthProfile>;
+interface OpenClawConfig {
+  models?: {
+    providers?: Record<string, RawProviderConfig>;
+  };
+}
+
+async function findOpenClawDistRoot(): Promise<string | null> {
+  const candidates: string[] = [];
+
+  if (process.env.OPENCLAW_DIST_ROOT) {
+    candidates.push(path.resolve(process.env.OPENCLAW_DIST_ROOT));
+  }
+
+  // Walk up from the gateway entry (e.g. /app/openclaw.mjs → /app/dist).
+  if (process.argv[1]) {
+    let cur = path.dirname(path.resolve(process.argv[1]));
+    for (let i = 0; i < 6; i++) {
+      candidates.push(path.join(cur, "dist"));
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      cur = parent;
+    }
+  }
+
+  // Classic npm-installed fallback (non-bundled hosts).
+  try {
+    const requireFn = createRequire(import.meta.url);
+    const resolved = requireFn.resolve("openclaw/dist/agents/model-catalog.runtime.js");
+    candidates.push(path.dirname(path.dirname(resolved)));
+  } catch {
+    // ignore — bundled hosts won't resolve this
+  }
+
+  for (const c of candidates) {
+    try {
+      await fsp.access(path.join(c, "agents", "model-catalog.runtime.js"));
+      return c;
+    } catch {
+      // try next
+    }
+  }
+
+  return null;
 }
 
 interface OpenClawInternals {
-  loadGatewayModelCatalog: () => Promise<RawModel[]>;
-  ensureAuthProfileStore: (agentDir: string) => RawAuthStore;
-  resolveOpenClawAgentDir: () => string;
+  loadModelCatalog: (params?: { useCache?: boolean }) => Promise<RawModel[]>;
+  distRoot: string;
 }
 
 async function loadInternals(): Promise<OpenClawInternals> {
-  let modelCatalogMod: unknown;
-  let authProfilesMod: unknown;
-  let agentPathsMod: unknown;
+  const distRoot = await findOpenClawDistRoot();
+  if (!distRoot) {
+    throw new AdapterError(
+      "openclaw_dist_not_found",
+      `Could not locate openclaw dist (checked OPENCLAW_DIST_ROOT, parent of process.argv[1]=${process.argv[1] ?? "<unset>"}, and npm openclaw resolve)`,
+    );
+  }
+
+  const modelCatalogPath = path.join(distRoot, "agents", "model-catalog.runtime.js");
+  let mod: unknown;
   try {
-    modelCatalogMod = await import("openclaw/dist/gateway/server-model-catalog.js");
-    authProfilesMod = await import("openclaw/dist/agents/auth-profiles.js");
-    agentPathsMod = await import("openclaw/dist/agents/agent-paths.js");
+    mod = await import(pathToFileURL(modelCatalogPath).href);
   } catch (err) {
     throw new AdapterError(
       "openclaw_internals_unresolved",
-      `Failed to import OpenClaw internals (managed-host pin drift?): ${(err as Error).message}`,
+      `Failed to import ${modelCatalogPath}: ${(err as Error).message}`,
     );
   }
 
-  const loadGatewayModelCatalog = (modelCatalogMod as { loadGatewayModelCatalog?: unknown })
-    .loadGatewayModelCatalog;
-  const ensureAuthProfileStore = (authProfilesMod as { ensureAuthProfileStore?: unknown })
-    .ensureAuthProfileStore;
-  const resolveOpenClawAgentDir = (agentPathsMod as { resolveOpenClawAgentDir?: unknown })
-    .resolveOpenClawAgentDir;
-
-  if (typeof loadGatewayModelCatalog !== "function") {
+  const loadModelCatalog = (mod as { loadModelCatalog?: unknown }).loadModelCatalog;
+  if (typeof loadModelCatalog !== "function") {
     throw new AdapterError(
       "openclaw_internals_shape_drift",
-      "openclaw/dist/gateway/server-model-catalog.js missing loadGatewayModelCatalog export",
-    );
-  }
-  if (typeof ensureAuthProfileStore !== "function") {
-    throw new AdapterError(
-      "openclaw_internals_shape_drift",
-      "openclaw/dist/agents/auth-profiles.js missing ensureAuthProfileStore export",
-    );
-  }
-  if (typeof resolveOpenClawAgentDir !== "function") {
-    throw new AdapterError(
-      "openclaw_internals_shape_drift",
-      "openclaw/dist/agents/agent-paths.js missing resolveOpenClawAgentDir export",
+      `${modelCatalogPath} missing loadModelCatalog export`,
     );
   }
 
   return {
-    loadGatewayModelCatalog: loadGatewayModelCatalog as OpenClawInternals["loadGatewayModelCatalog"],
-    ensureAuthProfileStore: ensureAuthProfileStore as OpenClawInternals["ensureAuthProfileStore"],
-    resolveOpenClawAgentDir: resolveOpenClawAgentDir as OpenClawInternals["resolveOpenClawAgentDir"],
+    loadModelCatalog: loadModelCatalog as OpenClawInternals["loadModelCatalog"],
+    distRoot,
   };
+}
+
+function readOpenClawConfig(): OpenClawConfig {
+  const home = process.env.OPENCLAW_HOME || path.join(os.homedir(), ".openclaw");
+  const cfgPath = path.join(home, "openclaw.json");
+  try {
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    return JSON.parse(raw) as OpenClawConfig;
+  } catch {
+    return {};
+  }
+}
+
+function buildProviderAuthMap(cfg: OpenClawConfig): Map<string, AuthState> {
+  const map = new Map<string, AuthState>();
+  const providers = cfg.models?.providers ?? {};
+  for (const [providerId, providerCfg] of Object.entries(providers)) {
+    const apiKey = typeof providerCfg?.apiKey === "string" ? providerCfg.apiKey.trim() : "";
+    map.set(providerId, apiKey.length > 0 ? "authenticated" : "missing");
+  }
+  return map;
 }
 
 function deriveCapabilities(raw: RawModel): string[] | undefined {
@@ -116,19 +180,6 @@ function deriveCapabilities(raw: RawModel): string[] | undefined {
   return caps.length > 0 ? caps : undefined;
 }
 
-function buildProviderAuthMap(store: RawAuthStore): Map<string, { authState: AuthState; profile?: string }> {
-  const map = new Map<string, { authState: AuthState; profile?: string }>();
-  const profiles = store.profiles ?? {};
-  for (const [profileId, cred] of Object.entries(profiles)) {
-    const provider = String(cred?.provider ?? "").trim();
-    if (!provider) continue;
-    if (!map.has(provider)) {
-      map.set(provider, { authState: "authenticated", profile: profileId });
-    }
-  }
-  return map;
-}
-
 /**
  * Build the bounded ModelsCatalog from in-process OpenClaw truth.
  *
@@ -137,11 +188,9 @@ function buildProviderAuthMap(store: RawAuthStore): Map<string, { authState: Aut
  */
 export async function buildCatalog(): Promise<{ catalog: ModelsCatalog; cliVersion: string | null }> {
   const internals = await loadInternals();
-
-  const agentDir = internals.resolveOpenClawAgentDir();
-  const rawModels = await internals.loadGatewayModelCatalog();
-  const authStore = internals.ensureAuthProfileStore(agentDir);
-  const providerAuth = buildProviderAuthMap(authStore);
+  const rawModels = await internals.loadModelCatalog({ useCache: false });
+  const cfg = readOpenClawConfig();
+  const providerAuth = buildProviderAuthMap(cfg);
 
   const providersById = new Map<string, ProviderEntry>();
   const models: ModelEntry[] = [];
@@ -151,8 +200,8 @@ export async function buildCatalog(): Promise<{ catalog: ModelsCatalog; cliVersi
     const id = String(raw.id ?? "").trim();
     if (!provider || !id) continue;
 
-    const authInfo = providerAuth.get(provider);
-    const available = authInfo?.authState === "authenticated";
+    const authState = providerAuth.get(provider) ?? "missing";
+    const available = authState === "authenticated";
 
     const entry: ModelEntry = {
       key: id,
@@ -170,39 +219,30 @@ export async function buildCatalog(): Promise<{ catalog: ModelsCatalog; cliVersi
     models.push(entry);
 
     if (!providersById.has(provider)) {
-      providersById.set(provider, {
-        id: provider,
-        authState: authInfo?.authState ?? "missing",
-        ...(authInfo?.profile ? { authProfile: authInfo.profile } : {}),
-      });
+      providersById.set(provider, { id: provider, authState });
     }
   }
 
-  for (const [providerId, info] of providerAuth.entries()) {
+  for (const [providerId, authState] of providerAuth.entries()) {
     if (!providersById.has(providerId)) {
-      providersById.set(providerId, {
-        id: providerId,
-        authState: info.authState,
-        ...(info.profile ? { authProfile: info.profile } : {}),
-      });
+      providersById.set(providerId, { id: providerId, authState });
     }
   }
-
-  const cliVersion = readCliVersion();
 
   return {
     catalog: {
       models,
       providers: Array.from(providersById.values()),
     },
-    cliVersion,
+    cliVersion: readCliVersion(internals.distRoot),
   };
 }
 
-function readCliVersion(): string | null {
+function readCliVersion(distRoot: string): string | null {
+  const pkgPath = path.join(path.dirname(distRoot), "package.json");
   try {
-    const requireFn = createRequire(import.meta.url);
-    const pkg = requireFn("openclaw/package.json") as { version?: unknown };
+    const raw = fs.readFileSync(pkgPath, "utf8");
+    const pkg = JSON.parse(raw) as { version?: unknown };
     return typeof pkg.version === "string" ? pkg.version : null;
   } catch {
     return null;
