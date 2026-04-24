@@ -77,8 +77,16 @@ async function findOpenClawDistRoot(): Promise<string | null> {
   }
 
   // Walk up from the gateway entry (e.g. /app/openclaw.mjs → /app/dist).
+  // argv[1] is often a symlink (e.g. /usr/local/bin/openclaw → /app/openclaw.mjs);
+  // resolve it so the walk anchors at the real bundle root.
   if (process.argv[1]) {
-    let cur = path.dirname(path.resolve(process.argv[1]));
+    let resolved = path.resolve(process.argv[1]);
+    try {
+      resolved = fs.realpathSync(resolved);
+    } catch {
+      // ignore — fall back to the lexical path
+    }
+    let cur = path.dirname(resolved);
     for (let i = 0; i < 6; i++) {
       candidates.push(path.join(cur, "dist"));
       const parent = path.dirname(cur);
