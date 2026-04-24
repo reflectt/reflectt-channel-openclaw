@@ -803,23 +803,10 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
       // startAccount, including reload.configPrefixes triggers (models,
       // providers, auth). Adapter failure publishes a degraded ok:false
       // envelope — never silent, never subprocess fallback.
-      //
-      // Kill switch: REFLECTT_DISABLE_MODELS_PUBLISH=1 skips the publish-up
-      // path entirely. Temporary staging-only diagnostic (task-gk6wyuwkg /
-      // task-1777061555422-f0odgq5wh) — used to confirm or discard the
-      // hypothesis that the plugin's in-process adapter load is implicated
-      // in the managed-host embedded/tool-call crash. Do NOT treat this
-      // flag as a permanent fix without kai's sign-off on the verdict.
-      if (process.env.REFLECTT_DISABLE_MODELS_PUBLISH === "1") {
-        ctx.log?.warn?.(
-          "[reflectt][models] publish-up SKIPPED — REFLECTT_DISABLE_MODELS_PUBLISH=1 set (diagnostic kill switch)",
-        );
-      } else {
-        for (const acct of allAccounts) {
-          publishModelsCatalog({ url: acct.url, log: ctx.log }).catch((err) => {
-            ctx.log?.warn?.(`[reflectt][models] publish threw for ${acct.accountId}: ${err}`);
-          });
-        }
+      for (const acct of allAccounts) {
+        publishModelsCatalog({ url: acct.url, log: ctx.log }).catch((err) => {
+          ctx.log?.warn?.(`[reflectt][models] publish threw for ${acct.accountId}: ${err}`);
+        });
       }
       // ───────────────────────────────────────────────────────────────────────
 
