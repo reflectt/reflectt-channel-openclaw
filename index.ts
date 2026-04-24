@@ -16,10 +16,6 @@ function httpModule(url: string): typeof http | typeof https {
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
@@ -1613,108 +1609,6 @@ function registerAgentConfigHttpBridge(api: OpenClawPluginApi): void {
   });
 }
 
-// ── Models capability HTTP bridge ──────────────────────────────────────────
-//
-// Locked seam (kai 2026-04-23): Reflectt's models capability is OpenClaw truth,
-// not Reflectt-owned. Cloud proxies through this plugin route so the agent
-// detail panel renders model/fallbacks dropdowns from live OpenClaw state —
-// supported providers, configured models, full picker catalog, auth status.
-//
-// Handler runs three fixed CLI commands in parallel; no arbitrary args. Cloud
-// LRU-caches the response (~30s) so panel renders don't re-shell per request.
-
-const MODELS_ROUTE_PATH = "/api/channels/reflectt/models";
-
-interface ModelsEnvelope {
-  evaluatedAt: string;
-  ok: boolean;
-  errors: string[];
-  cliVersion: string | null;
-  status: unknown | null;     // openclaw models status --json
-  configured: unknown | null; // openclaw models list --json
-  catalog: unknown | null;    // openclaw models list --all --json
-}
-
-async function readOpenclawVersion(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync("openclaw", ["--version"], { timeout: 3000 });
-    // Output is `2026.4.14` or similar — single line; strip whitespace.
-    const v = stdout.trim().split(/\r?\n/)[0]?.trim();
-    return v || null;
-  } catch {
-    return null;
-  }
-}
-
-async function runOpenclawJson(args: string[], timeoutMs = 10000): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
-  try {
-    const { stdout } = await execFileAsync("openclaw", args, {
-      timeout: timeoutMs,
-      maxBuffer: 16 * 1024 * 1024, // 844-model catalog is ~hundreds of KB
-    });
-    try {
-      return { ok: true, data: JSON.parse(stdout) };
-    } catch (parseErr) {
-      return { ok: false, error: `parse: ${String((parseErr as Error).message ?? parseErr)}` };
-    }
-  } catch (err) {
-    const e = err as { message?: string; stderr?: string | Buffer };
-    const detail = e.stderr ? String(e.stderr).trim().slice(0, 500) : String(e.message ?? err);
-    return { ok: false, error: `exec: ${detail}` };
-  }
-}
-
-async function handleModelsGet(api: OpenClawPluginApi, res: http.ServerResponse): Promise<void> {
-  const [statusRes, configuredRes, catalogRes, cliVersion] = await Promise.all([
-    runOpenclawJson(["models", "status", "--json"]),
-    runOpenclawJson(["models", "list", "--json"]),
-    runOpenclawJson(["models", "list", "--all", "--json"]),
-    readOpenclawVersion(),
-  ]);
-
-  const errors: string[] = [];
-  if (!statusRes.ok) errors.push(`status: ${statusRes.error}`);
-  if (!configuredRes.ok) errors.push(`configured: ${configuredRes.error}`);
-  if (!catalogRes.ok) errors.push(`catalog: ${catalogRes.error}`);
-
-  const envelope: ModelsEnvelope = {
-    evaluatedAt: new Date().toISOString(),
-    ok: errors.length === 0,
-    errors,
-    cliVersion,
-    status: statusRes.ok ? statusRes.data : null,
-    configured: configuredRes.ok ? configuredRes.data : null,
-    catalog: catalogRes.ok ? catalogRes.data : null,
-  };
-
-  if (!envelope.ok) {
-    api.logger.warn(`[reflectt][models] partial: ${errors.join("; ")}`);
-  }
-
-  // 200 even on partial failure — cloud needs whatever truth is available so
-  // the panel can degrade gracefully (e.g. show configured set if catalog exec
-  // hiccuped). `ok` + `errors` give the consumer enough to render a banner.
-  jsonResponse(res, 200, { success: true, models: envelope });
-}
-
-function registerModelsHttpBridge(api: OpenClawPluginApi): void {
-  api.registerHttpRoute({
-    path: MODELS_ROUTE_PATH,
-    auth: "gateway",
-    match: "exact",
-    replaceExisting: true,
-    handler: async (req, res) => {
-      const method = (req.method ?? "GET").toUpperCase();
-      if (method !== "GET") {
-        res.setHeader("Allow", "GET");
-        jsonResponse(res, 405, { success: false, error: `method ${method} not allowed on models bridge` });
-        return;
-      }
-      await handleModelsGet(api, res);
-    },
-  });
-}
-
 // Single registration covering all three agent-detail bridges (identity write,
 // files read, memory index read) under the shared `/api/channels/reflectt/agents/`
 // prefix. Migrated from the removed `api.registerHttpHandler(...)` chain pattern
@@ -1776,8 +1670,6 @@ const plugin = {
     api.logger.info(`[reflectt] Registered agent-detail bridges at ${IDENTITY_ROUTE_PREFIX} (suffixes: ${IDENTITY_ROUTE_SUFFIX}, ${FILES_ROUTE_SUFFIX}, ${MEMORY_ROUTE_SUFFIX})`);
     registerAgentConfigHttpBridge(api);
     api.logger.info(`[reflectt] Registered agent-config bridge at ${CONFIG_ROUTE_PREFIX}`);
-    registerModelsHttpBridge(api);
-    api.logger.info(`[reflectt] Registered models bridge at ${MODELS_ROUTE_PATH}`);
   },
 };
 
