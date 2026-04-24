@@ -487,6 +487,15 @@ function stopHealthCheck() {
   }
 }
 
+function waitForAbort(signal?: AbortSignal): Promise<void> {
+  if (!signal || signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
 function startWatchdog(url: string, ctx: any) {
   if (watchdogTimer) return;
 
@@ -895,19 +904,19 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
         });
       }
 
-      return {
-        stop: () => {
-          stopped = true;
-          stopAgentRefresh();
-          stopWatchdog();
-          stopHealthCheck();
-          if (unsubUsage) { unsubUsage(); unsubUsage = null; usageHookActive = false; usageSeenSeqs.clear(); }
-          if (usageSeenCleanupTimer) { clearInterval(usageSeenCleanupTimer); usageSeenCleanupTimer = null; }
-          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-          destroySSE(ctx, "plugin stopped");
-          ctx.log?.info("[reflectt] Stopped");
-        },
-      };
+      try {
+        await waitForAbort(ctx.abortSignal);
+      } finally {
+        stopped = true;
+        stopAgentRefresh();
+        stopWatchdog();
+        stopHealthCheck();
+        if (unsubUsage) { unsubUsage(); unsubUsage = null; usageHookActive = false; usageSeenSeqs.clear(); }
+        if (usageSeenCleanupTimer) { clearInterval(usageSeenCleanupTimer); usageSeenCleanupTimer = null; }
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        destroySSE(ctx, "plugin stopped");
+        ctx.log?.info("[reflectt] Stopped");
+      }
     },
   },
 };
