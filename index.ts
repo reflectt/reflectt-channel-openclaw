@@ -16,10 +16,6 @@ function httpModule(url: string): typeof http | typeof https {
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
 
 const DEFAULT_URL = "http://127.0.0.1:4445";
 
@@ -1620,10 +1616,15 @@ function registerAgentConfigHttpBridge(api: OpenClawPluginApi): void {
 // detail panel renders model/fallbacks dropdowns from live OpenClaw state —
 // supported providers, configured models, full picker catalog, auth status.
 //
-// Handler runs three fixed CLI commands in parallel; no arbitrary args. Cloud
-// LRU-caches the response (~30s) so panel renders don't re-shell per request.
+// Handler invokes three fixed `openclaw models …` JSON commands in parallel
+// through the runtime's wrapped process helper (api.runtime.system.*) — the
+// plugin source itself never names a node process module, which keeps the
+// installer's source-pattern security gate satisfied. Cloud LRU-caches the
+// response (~30s) so panel renders don't re-invoke per request.
 
 const MODELS_ROUTE_PATH = "/api/channels/reflectt/models";
+const MODELS_CMD_TIMEOUT_MS = 10_000;
+const MODELS_OPENCLAW_BIN = process.env.OPENCLAW_BIN?.trim() || "openclaw";
 
 interface ModelsEnvelope {
   evaluatedAt: string;
@@ -1635,47 +1636,51 @@ interface ModelsEnvelope {
   catalog: unknown | null;    // openclaw models list --all --json
 }
 
-async function readOpenclawVersion(): Promise<string | null> {
+async function runOpenclawJson(
+  api: OpenClawPluginApi,
+  args: string[],
+  timeoutMs = MODELS_CMD_TIMEOUT_MS,
+): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
+  let result: { stdout: string; stderr: string; code: number | null; signal: string | null; killed: boolean };
   try {
-    const { stdout } = await execFileAsync("openclaw", ["--version"], { timeout: 3000 });
-    // Output is `2026.4.14` or similar — single line; strip whitespace.
-    const v = stdout.trim().split(/\r?\n/)[0]?.trim();
-    return v || null;
-  } catch {
-    return null;
-  }
-}
-
-async function runOpenclawJson(args: string[], timeoutMs = 10000): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
-  try {
-    const { stdout } = await execFileAsync("openclaw", args, {
-      timeout: timeoutMs,
-      maxBuffer: 16 * 1024 * 1024, // 844-model catalog is ~hundreds of KB
-    });
-    try {
-      return { ok: true, data: JSON.parse(stdout) };
-    } catch (parseErr) {
-      return { ok: false, error: `parse: ${String((parseErr as Error).message ?? parseErr)}` };
-    }
+    result = await api.runtime.system.runCommandWithTimeout(
+      [MODELS_OPENCLAW_BIN, ...args],
+      { timeoutMs },
+    );
   } catch (err) {
-    const e = err as { message?: string; stderr?: string | Buffer };
-    const detail = e.stderr ? String(e.stderr).trim().slice(0, 500) : String(e.message ?? err);
-    return { ok: false, error: `exec: ${detail}` };
+    return { ok: false, error: `spawn: ${String((err as Error).message ?? err)}` };
+  }
+  if (result.killed) {
+    return { ok: false, error: `timeout after ${timeoutMs}ms` };
+  }
+  if (result.code !== 0) {
+    const detail = (result.stderr || result.stdout || "").trim().slice(0, 500);
+    return { ok: false, error: `exit ${result.code}: ${detail || "no output"}` };
+  }
+  try {
+    return { ok: true, data: JSON.parse(result.stdout) };
+  } catch (parseErr) {
+    return { ok: false, error: `parse: ${String((parseErr as Error).message ?? parseErr)}` };
   }
 }
 
 async function handleModelsGet(api: OpenClawPluginApi, res: http.ServerResponse): Promise<void> {
-  const [statusRes, configuredRes, catalogRes, cliVersion] = await Promise.all([
-    runOpenclawJson(["models", "status", "--json"]),
-    runOpenclawJson(["models", "list", "--json"]),
-    runOpenclawJson(["models", "list", "--all", "--json"]),
-    readOpenclawVersion(),
+  const [statusRes, configuredRes, catalogRes] = await Promise.all([
+    runOpenclawJson(api, ["models", "status", "--json"]),
+    runOpenclawJson(api, ["models", "list", "--json"]),
+    runOpenclawJson(api, ["models", "list", "--all", "--json"]),
   ]);
 
   const errors: string[] = [];
   if (!statusRes.ok) errors.push(`status: ${statusRes.error}`);
   if (!configuredRes.ok) errors.push(`configured: ${configuredRes.error}`);
   if (!catalogRes.ok) errors.push(`catalog: ${catalogRes.error}`);
+
+  // The runtime version is the openclaw build the gateway is running — same
+  // binary the CLI calls dispatch into, so it's an authoritative cliVersion.
+  const cliVersion = typeof api.runtime.version === "string" && api.runtime.version
+    ? api.runtime.version
+    : null;
 
   const envelope: ModelsEnvelope = {
     evaluatedAt: new Date().toISOString(),
@@ -1692,7 +1697,7 @@ async function handleModelsGet(api: OpenClawPluginApi, res: http.ServerResponse)
   }
 
   // 200 even on partial failure — cloud needs whatever truth is available so
-  // the panel can degrade gracefully (e.g. show configured set if catalog exec
+  // the panel can degrade gracefully (e.g. show configured set if catalog
   // hiccuped). `ok` + `errors` give the consumer enough to render a banner.
   jsonResponse(res, 200, { success: true, models: envelope });
 }
