@@ -402,6 +402,20 @@ function connectSSE(url: string, account: ReflecttAccount, ctx: any) {
           } catch (e) {
             ctx.log?.error(`[reflectt] batch parse error: ${e}`);
           }
+        } else if (eventType === "agent_identity_changed" && eventData) {
+          try {
+            const payload = JSON.parse(eventData);
+            const newName = payload?.newName;
+            const previousName = payload?.previousName;
+            ctx.log?.info(`[reflectt] identity changed: ${previousName} → ${newName}`);
+            if (newName) {
+              for (const agentId of discoveredAgents) {
+                purgeSessionIndexEntry(agentId, `agent:${agentId}:reflectt:main`, ctx);
+              }
+            }
+          } catch (e) {
+            ctx.log?.error(`[reflectt] agent_identity_changed parse error: ${e}`);
+          }
         }
       }
     });
