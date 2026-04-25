@@ -191,9 +191,19 @@ function listAllAccountIds(cfg: OpenClawConfig): string[] {
 
 // --- HTTP helpers ---
 
-function postMessage(url: string, from: string, channel: string, content: string): Promise<void> {
+function postMessage(
+  url: string,
+  from: string,
+  channel: string,
+  content: string,
+  extra?: { attachments?: unknown[] },
+): Promise<void> {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ from, channel, content });
+    const payload: Record<string, unknown> = { from, channel, content };
+    if (extra?.attachments && Array.isArray(extra.attachments) && extra.attachments.length > 0) {
+      payload.attachments = extra.attachments;
+    }
+    const body = JSON.stringify(payload);
     const parsed = new URL(`${url}/chat/messages`);
     const req = httpModule(url).request({
       hostname: parsed.hostname,
@@ -706,9 +716,19 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         deliver: async (payload: any) => {
           const text = payload.text || payload.content || "";
-          if (text) {
-            ctx.log?.info(`[reflectt] Reply → ${channel}: ${text.slice(0, 60)}...`);
-            await postMessage(url, agentName!, channel, text);
+          const attachments = Array.isArray(payload.attachments) ? payload.attachments : undefined;
+          const payloadKeys = Object.keys(payload || {});
+          const nonTextKeys = payloadKeys.filter((k) => k !== "text" && k !== "content");
+          if (nonTextKeys.length > 0) {
+            ctx.log?.info(
+              `[reflectt][payload-shape] keys=${payloadKeys.join(",")} attachments=${attachments?.length ?? 0}`,
+            );
+          }
+          if (text || (attachments && attachments.length > 0)) {
+            ctx.log?.info(
+              `[reflectt] Reply → ${channel}: ${text.slice(0, 60)}... attachments=${attachments?.length ?? 0}`,
+            );
+            await postMessage(url, agentName!, channel, text, { attachments });
           }
         },
         onError: (err: unknown) => {
@@ -772,7 +792,7 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
   },
   capabilities: {
     chatTypes: ["group"],
-    media: false,
+    media: true,
   },
   // configPrefixes drive gateway.startAccount re-invocation:
   //  - "channels.reflectt": channel config edits restart SSE/watchdog
