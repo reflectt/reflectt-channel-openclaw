@@ -192,11 +192,39 @@ function listAllAccountIds(cfg: OpenClawConfig): string[] {
 // --- HTTP helpers ---
 
 // Map OpenClaw reply payload's media fields onto native ChatAttachment shape.
+// Hard cap for inlining trusted local image bytes as data: URLs. Above this we
+// drop the attachment and emit a loud log line — kai's directive: don't
+// silently widen by exposing an unfetchable local path or by bloating SSE rows.
+const INLINE_MAX_BYTES = 2 * 1024 * 1024;
+
+function mimeFromExt(ext: string | undefined): string {
+  switch (ext) {
+    case "png": return "image/png";
+    case "jpg":
+    case "jpeg": return "image/jpeg";
+    case "gif": return "image/gif";
+    case "webp": return "image/webp";
+    case "svg": return "image/svg+xml";
+    case "mp3": return "audio/mpeg";
+    case "wav": return "audio/wav";
+    case "ogg": return "audio/ogg";
+    case "m4a": return "audio/mp4";
+    case "mp4": return "video/mp4";
+    case "webm": return "video/webm";
+    default: return "application/octet-stream";
+  }
+}
+
 // OpenClaw surfaces structured artifacts as `payload.mediaUrls` (array) and
 // `payload.mediaUrl` (singular); reflectt-node and the canvas renderer expect
 // `attachments: Array<{id,name,size,mimeType,url}>`. Pass-through any explicit
 // `payload.attachments` first so callers that already use the native shape win.
-function collectNativeAttachments(payload: any): Array<Record<string, unknown>> | undefined {
+//
+// When OpenClaw flags `payload.trustedLocalMedia === true` and the URL is a
+// local absolute path to an image, inline as a `data:` URL so canvas can
+// render it (canvas cannot fetch gateway-local filesystem paths). Lane scope
+// per kai is image only; non-image local paths pass through unchanged.
+function collectNativeAttachments(payload: any, log?: { info?: (m: string) => void; warn?: (m: string) => void }): Array<Record<string, unknown>> | undefined {
   const out: Array<Record<string, unknown>> = [];
   if (Array.isArray(payload?.attachments)) {
     for (const a of payload.attachments) {
@@ -212,27 +240,41 @@ function collectNativeAttachments(payload: any): Array<Record<string, unknown>> 
   if (typeof payload?.mediaUrl === "string" && payload.mediaUrl.length > 0 && !urls.includes(payload.mediaUrl)) {
     urls.push(payload.mediaUrl);
   }
+  const trustedLocalMedia = payload?.trustedLocalMedia === true;
   const baseTs = Date.now();
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
-    let name: string;
-    try { name = new URL(url).pathname.split("/").pop() || `media-${i}`; }
-    catch { name = `media-${i}`; }
+    const lastSlash = url.lastIndexOf("/");
+    const tail = lastSlash >= 0 ? url.slice(lastSlash + 1) : url;
+    const name = tail.length > 0 ? tail : `media-${i}`;
     const ext = name.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
-    const mimeType =
-      ext === "png" ? "image/png" :
-      ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
-      ext === "gif" ? "image/gif" :
-      ext === "webp" ? "image/webp" :
-      ext === "svg" ? "image/svg+xml" :
-      ext === "mp3" ? "audio/mpeg" :
-      ext === "wav" ? "audio/wav" :
-      ext === "ogg" ? "audio/ogg" :
-      ext === "m4a" ? "audio/mp4" :
-      ext === "mp4" ? "video/mp4" :
-      ext === "webm" ? "video/webm" :
-      "application/octet-stream";
-    out.push({ id: `att-${baseTs}-${i}`, name, size: 0, mimeType, url });
+    const mimeType = mimeFromExt(ext);
+
+    let finalUrl = url;
+    let size = 0;
+    const isAbsolutePath = url.startsWith("/") && !url.startsWith("//");
+    const isImage = mimeType.startsWith("image/");
+
+    if (trustedLocalMedia && isAbsolutePath && isImage) {
+      try {
+        const stats = fs.statSync(url);
+        if (stats.size > INLINE_MAX_BYTES) {
+          log?.warn?.(
+            `[reflectt][inline] OVERSIZE ${url} size=${stats.size}B > limit=${INLINE_MAX_BYTES}B — dropping (no silent widening)`,
+          );
+          continue;
+        }
+        const buf = fs.readFileSync(url);
+        finalUrl = `data:${mimeType};base64,${buf.toString("base64")}`;
+        size = stats.size;
+        log?.info?.(`[reflectt][inline] image ${name} (${stats.size}B, ${mimeType}) → data:`);
+      } catch (e: any) {
+        log?.warn?.(`[reflectt][inline] read failed ${url}: ${e?.message ?? e}`);
+        continue;
+      }
+    }
+
+    out.push({ id: `att-${baseTs}-${i}`, name, size, mimeType, url: finalUrl });
   }
   return out.length > 0 ? out : undefined;
 }
@@ -762,7 +804,7 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         deliver: async (payload: any) => {
           const text = payload.text || payload.content || "";
-          const attachments = collectNativeAttachments(payload);
+          const attachments = collectNativeAttachments(payload, ctx.log);
           const payloadKeys = Object.keys(payload || {});
           const nonTextKeys = payloadKeys.filter((k) => k !== "text" && k !== "content");
           if (nonTextKeys.length > 0) {
