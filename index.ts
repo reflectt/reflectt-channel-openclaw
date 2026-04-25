@@ -191,6 +191,52 @@ function listAllAccountIds(cfg: OpenClawConfig): string[] {
 
 // --- HTTP helpers ---
 
+// Map OpenClaw reply payload's media fields onto native ChatAttachment shape.
+// OpenClaw surfaces structured artifacts as `payload.mediaUrls` (array) and
+// `payload.mediaUrl` (singular); reflectt-node and the canvas renderer expect
+// `attachments: Array<{id,name,size,mimeType,url}>`. Pass-through any explicit
+// `payload.attachments` first so callers that already use the native shape win.
+function collectNativeAttachments(payload: any): Array<Record<string, unknown>> | undefined {
+  const out: Array<Record<string, unknown>> = [];
+  if (Array.isArray(payload?.attachments)) {
+    for (const a of payload.attachments) {
+      if (a && typeof a === "object") out.push(a as Record<string, unknown>);
+    }
+  }
+  const urls: string[] = [];
+  if (Array.isArray(payload?.mediaUrls)) {
+    for (const u of payload.mediaUrls) {
+      if (typeof u === "string" && u.length > 0 && !urls.includes(u)) urls.push(u);
+    }
+  }
+  if (typeof payload?.mediaUrl === "string" && payload.mediaUrl.length > 0 && !urls.includes(payload.mediaUrl)) {
+    urls.push(payload.mediaUrl);
+  }
+  const baseTs = Date.now();
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
+    let name: string;
+    try { name = new URL(url).pathname.split("/").pop() || `media-${i}`; }
+    catch { name = `media-${i}`; }
+    const ext = name.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+    const mimeType =
+      ext === "png" ? "image/png" :
+      ext === "jpg" || ext === "jpeg" ? "image/jpeg" :
+      ext === "gif" ? "image/gif" :
+      ext === "webp" ? "image/webp" :
+      ext === "svg" ? "image/svg+xml" :
+      ext === "mp3" ? "audio/mpeg" :
+      ext === "wav" ? "audio/wav" :
+      ext === "ogg" ? "audio/ogg" :
+      ext === "m4a" ? "audio/mp4" :
+      ext === "mp4" ? "video/mp4" :
+      ext === "webm" ? "video/webm" :
+      "application/octet-stream";
+    out.push({ id: `att-${baseTs}-${i}`, name, size: 0, mimeType, url });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 function postMessage(
   url: string,
   from: string,
@@ -716,7 +762,7 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       const dispatcher = runtime.channel.reply.createReplyDispatcherWithTyping({
         deliver: async (payload: any) => {
           const text = payload.text || payload.content || "";
-          const attachments = Array.isArray(payload.attachments) ? payload.attachments : undefined;
+          const attachments = collectNativeAttachments(payload);
           const payloadKeys = Object.keys(payload || {});
           const nonTextKeys = payloadKeys.filter((k) => k !== "text" && k !== "content");
           if (nonTextKeys.length > 0) {
