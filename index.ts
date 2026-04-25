@@ -254,8 +254,9 @@ function collectNativeAttachments(payload: any, log?: { info?: (m: string) => vo
     let size = 0;
     const isAbsolutePath = url.startsWith("/") && !url.startsWith("//");
     const isImage = mimeType.startsWith("image/");
+    const isOpenClawLocalMedia = url.startsWith("/home/node/.openclaw/");
 
-    if (trustedLocalMedia && isAbsolutePath && isImage) {
+    if (isImage && isAbsolutePath && (trustedLocalMedia || isOpenClawLocalMedia)) {
       try {
         const stats = fs.statSync(url);
         if (stats.size > INLINE_MAX_BYTES) {
