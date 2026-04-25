@@ -306,6 +306,29 @@ function postMessage(
   });
 }
 
+// Posts agent presence status to reflectt-node so canvas can render the real
+// reply lifecycle (working while the dispatcher is producing a reply, idle on
+// cleanup). The /presence/:agent endpoint accepts {status, task?, since?}.
+function postPresence(
+  url: string,
+  agent: string,
+  status: "working" | "idle",
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ status });
+    const parsed = new URL(`${url}/presence/${encodeURIComponent(agent)}`);
+    const req = httpModule(url).request({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : undefined),
+      path: parsed.pathname,
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+    }, (res) => { res.resume(); resolve(); });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
 function normalizeSenderId(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const id = value.trim().toLowerCase().replace(/^@+/, "");
@@ -819,6 +842,21 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
             );
             await postMessage(url, agentName!, channel, text, { attachments });
           }
+        },
+        // Real reply lifecycle → canvas presence. onReplyStart fires when the
+        // dispatcher actually commits to producing a reply; onCleanup fires when
+        // the typing controller tears down (reply done, NO_REPLY, or aborted).
+        // No widening — only working/idle, paired strictly with the runtime's
+        // own start/cleanup signals.
+        onReplyStart: async () => {
+          postPresence(url, agentName!, "working").catch((err) => {
+            ctx.log?.warn(`[reflectt][presence] working post failed: ${err}`);
+          });
+        },
+        onCleanup: () => {
+          postPresence(url, agentName!, "idle").catch((err) => {
+            ctx.log?.warn(`[reflectt][presence] idle post failed: ${err}`);
+          });
         },
         onError: (err: unknown) => {
           ctx.log?.error(`[reflectt] Dispatch error: ${err}`);
