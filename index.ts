@@ -280,6 +280,50 @@ function collectNativeAttachments(payload: any, log?: { info?: (m: string) => vo
   return out.length > 0 ? out : undefined;
 }
 
+function resolveInboundMediaUrl(rawUrl: unknown, baseUrl: string): string | undefined {
+  if (typeof rawUrl !== "string") return undefined;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return undefined;
+  try {
+    return new URL(trimmed, `${baseUrl}/`).toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function collectInboundMedia(msg: any, baseUrl: string): { urls: string[]; mimeTypes: string[] } {
+  const urls: string[] = [];
+  const mimeTypes: string[] = [];
+  const seen = new Set<string>();
+
+  const push = (rawUrl: unknown, rawMimeType: unknown) => {
+    const resolvedUrl = resolveInboundMediaUrl(rawUrl, baseUrl);
+    if (!resolvedUrl || seen.has(resolvedUrl)) return;
+    seen.add(resolvedUrl);
+    urls.push(resolvedUrl);
+    mimeTypes.push(typeof rawMimeType === "string" ? rawMimeType.trim() : "");
+  };
+
+  if (Array.isArray(msg?.attachments)) {
+    for (const attachment of msg.attachments) {
+      if (!attachment || typeof attachment !== "object") continue;
+      push((attachment as any).url, (attachment as any).mimeType);
+    }
+  }
+
+  const metadata = msg?.metadata;
+  if (
+    urls.length === 0
+    && metadata
+    && typeof metadata === "object"
+    && metadata.eventType === "room_artifact_shared"
+  ) {
+    push((metadata as any).url, (metadata as any).mimeType);
+  }
+
+  return { urls, mimeTypes };
+}
+
 function postMessage(
   url: string,
   from: string,
@@ -784,6 +828,8 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
       // Room identity is preserved in OriginatingTo so replies route correctly.
       const sessionKey = `agent:${agentId}:reflectt:main`;
       
+      const inboundMedia = collectInboundMedia(msg, url);
+
       // Create message context
       const msgContext = {
         Body: content,
@@ -806,6 +852,12 @@ function handleInbound(data: string, url: string, account: ReflecttAccount, ctx:
         OriginatingTo: channel,
         WasMentioned: true,
         CommandAuthorized: false,
+        ...(inboundMedia.urls.length > 0 ? {
+          MediaUrls: inboundMedia.urls,
+          MediaTypes: inboundMedia.mimeTypes,
+          MediaUrl: inboundMedia.urls[0],
+          MediaType: inboundMedia.mimeTypes[0],
+        } : {}),
       };
 
       // Finalize context
