@@ -327,12 +327,14 @@ function collectInboundMedia(msg: any, baseUrl: string): { urls: string[]; mimeT
 function postMessage(
   url: string,
   from: string,
-  channel: string,
+  channel: string | undefined,
   content: string,
-  extra?: { attachments?: unknown[] },
+  extra?: { attachments?: unknown[]; to?: string },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const payload: Record<string, unknown> = { from, channel, content };
+    const payload: Record<string, unknown> = { from, content };
+    if (channel) payload.channel = channel;
+    if (extra?.to) payload.to = extra.to;
     if (extra?.attachments && Array.isArray(extra.attachments) && extra.attachments.length > 0) {
       payload.attachments = extra.attachments;
     }
@@ -1001,9 +1003,13 @@ const reflecttPlugin: ChannelPlugin<ReflecttAccount> = {
     sendText: async ({ to, text, accountId }) => {
       const cfg = pluginRuntime?.config?.loadConfig?.() ?? {};
       const account = resolveAccount(cfg, accountId);
-      // Determine agent name for "from" field
       const agentName = teamLeadAgent ?? "main";
-      await postMessage(account.url, agentName, "general", text ?? "");
+      // Honor `to:` end-to-end. Hardcoding "general" + dropping `to`
+      // meant every openclaw outbound DM landed in #general. Pass `to`
+      // through and leave `channel` undefined so node derives the
+      // stable `dm:<sorted endpoints>` channel.
+      const toStr = typeof to === "string" && to.trim() ? to.trim() : undefined;
+      await postMessage(account.url, agentName, undefined, text ?? "", { to: toStr });
       return { channel: "reflectt" as const, to, messageId: `rn-${Date.now()}` };
     },
   },
